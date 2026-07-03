@@ -256,3 +256,77 @@ fn backup_and_restore_roundtrip() {
     let _ = std::fs::remove_dir_all(&dst);
     let _ = std::fs::remove_file(&archive);
 }
+
+#[test]
+fn explain_shows_index_scan_for_pk_lookup() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+    let result = db
+        .execute("EXPLAIN SELECT * FROM users WHERE id = 1")
+        .unwrap();
+    assert_eq!(result.columns, vec!["QUERY PLAN"]);
+    let plan = result.rows[0].values[0].to_display_string();
+    assert!(plan.contains("Index Scan"), "expected index scan, got: {plan}");
+
+    let result = db.execute("EXPLAIN SELECT * FROM users").unwrap();
+    let plan = result.rows[0].values[0].to_display_string();
+    assert!(plan.contains("Seq Scan"), "expected seq scan, got: {plan}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_inserts_from_ten_clients() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = temp_data_dir();
+    let db = Arc::new(Database::open(&dir).unwrap());
+    db.execute("CREATE TABLE hits (id INT PRIMARY KEY, client INT, n INT)").unwrap();
+
+    let mut handles = Vec::new();
+
+    for client in 0..10 {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            for n in 0..10 {
+                let id = client * 100 + n;
+                db.execute(&format!(
+                    "INSERT INTO hits VALUES ({id}, {client}, {n})"
+                ))
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let count = db.execute("SELECT * FROM hits").unwrap().rows.len();
+    assert_eq!(count, 100, "expected 100 rows from 10x10 concurrent inserts");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_batch_sync_survives_checkpoint() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE sync_test (id INT PRIMARY KEY, v TEXT)").unwrap();
+    for i in 0..5 {
+        db.execute(&format!("INSERT INTO sync_test VALUES ({i}, 'x{i}')")).unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let db = Database::open(&dir).unwrap();
+    let result = db.execute("SELECT * FROM sync_test").unwrap();
+    assert_eq!(result.rows.len(), 5);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

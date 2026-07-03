@@ -1,4 +1,5 @@
 use sqlparser::ast::{BinaryOperator, Expr, Ident};
+use std::fmt;
 
 use crate::index::IndexManager;
 use crate::types::Value;
@@ -10,6 +11,17 @@ pub enum ScanPlan {
         index_name: String,
         key_values: Vec<Value>,
     },
+}
+
+impl fmt::Display for ScanPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanPlan::FullScan => write!(f, "Seq Scan"),
+            ScanPlan::IndexLookup { index_name, .. } => {
+                write!(f, "Index Scan using {index_name}")
+            }
+        }
+    }
 }
 
 pub fn plan_scan(

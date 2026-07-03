@@ -21,3 +21,7 @@ uuid.workspace = true
 tracing.workspace = true
 tar.workspace = true
 flate2.workspace = true
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"

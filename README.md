@@ -12,12 +12,14 @@ MoodengSQL is a blazing-fast, PostgreSQL-inspired relational database engine wri
 - **Binary persistence** — durable on-disk storage with bincode serialization
 - **Metadata persistence** — schema and indexes survive server restart (`meta.bin`)
 - **WAL + checkpoint** — write-ahead log with automatic checkpointing (every 50 ops)
+- **Batch WAL fsync** — groups disk sync every 10 ops for higher write throughput
 - **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` with undo log
 - **Index scan** — `SELECT ... WHERE col = value` uses B-tree index when available
 - **ORDER BY / LIMIT / OFFSET** — sorted and paginated queries
 - **INNER JOIN** — multi-table queries with `ON` clause
 - **GROUP BY** — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` aggregates
 - **Extended protocol** — Parse/Bind/Execute for parameterized queries (`$1`, `$2`)
+- **EXPLAIN** — query plan shows Index Scan vs Seq Scan
 - **Table-level locking** — concurrent connections with read/write locks
 - **Constraints** — PRIMARY KEY (auto-index) and NOT NULL enforcement
 - **Data validation** — `moodengsql --check` verifies catalog/storage consistency
@@ -112,6 +114,14 @@ docker compose exec moodengsql moodeng ping --config /etc/moodengsql/moodeng.tom
 ```
 
 Data is persisted in the `moodeng_data` Docker volume at `/data`.
+
+## Benchmark
+
+```bash
+cargo run --release --example benchmark -p moodeng-core
+```
+
+Prints insert and indexed point-select throughput for a quick sanity check.
 
 ## CLI Options
 

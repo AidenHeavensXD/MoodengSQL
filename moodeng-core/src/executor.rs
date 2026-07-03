@@ -101,6 +101,7 @@ impl<'a> Executor<'a> {
                     .collect();
                 self.create_index(&table, &index_name, cols, create.unique)
             }
+            Statement::Explain { statement, .. } => self.explain(statement.as_ref()),
             _ => Err(crate::error::MoodengError::Execution(format!(
                 "unsupported statement: {stmt}"
             ))),
@@ -309,6 +310,55 @@ impl<'a> Executor<'a> {
         }
 
         self.finalize_select(query, select, output_cols, result_rows, &col_names)
+    }
+
+    fn explain(&self, stmt: &Statement) -> crate::error::Result<QueryResult> {
+        let Statement::Query(query) = stmt else {
+            return Err(crate::error::MoodengError::Execution(
+                "EXPLAIN only supports SELECT queries".into(),
+            ));
+        };
+
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(crate::error::MoodengError::Parse(
+                "EXPLAIN only supports simple SELECT".into(),
+            ));
+        };
+
+        if !select.from.first().is_some_and(|f| f.joins.is_empty()) {
+            return Err(crate::error::MoodengError::Execution(
+                "EXPLAIN for JOIN not yet supported".into(),
+            ));
+        }
+
+        let table_name = select
+            .from
+            .first()
+            .map(|twj| table_factor_name(&twj.relation))
+            .ok_or_else(|| crate::error::MoodengError::Parse("missing FROM".into()))?;
+
+        let lock = self.locks.lock_for(&table_name);
+        let _guard = lock.read();
+        let schema = self.catalog.get_table(&table_name)?;
+        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let plan = plan_scan(
+            &table_name,
+            select.selection.as_ref(),
+            self.indexes,
+            &col_names,
+        );
+
+        let mut lines = vec![format!("{plan} on {table_name}")];
+        if let ScanPlan::IndexLookup { key_values, .. } = &plan {
+            if let Some(val) = key_values.first() {
+                lines.push(format!("  Index Cond: (= {val})"));
+            }
+        }
+
+        Ok(QueryResult::select(
+            vec!["QUERY PLAN".into()],
+            vec![Row::new(vec![Value::Text(lines.join("\n"))])],
+        ))
     }
 
     fn select_join(

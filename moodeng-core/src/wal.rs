@@ -9,6 +9,7 @@ use crate::storage::RowId;
 use crate::types::Row;
 
 const CHECKPOINT_INTERVAL: u64 = 50;
+const WAL_SYNC_BATCH: u64 = 10;
 const WAL_FILE: &str = "wal.log";
 const CHECKPOINT_FILE: &str = "checkpoint.bin";
 
@@ -42,6 +43,7 @@ pub struct WriteAheadLog {
     file: Mutex<File>,
     lsn: Mutex<u64>,
     ops_since_checkpoint: Mutex<u64>,
+    unsynced_writes: Mutex<u64>,
     checkpoint_lsn: u64,
 }
 
@@ -82,6 +84,7 @@ impl WriteAheadLog {
             file: Mutex::new(file),
             lsn: Mutex::new(current_lsn),
             ops_since_checkpoint: Mutex::new(0),
+            unsynced_writes: Mutex::new(0),
             checkpoint_lsn,
         })
     }
@@ -126,10 +129,24 @@ impl WriteAheadLog {
         file.write_all(&lsn.to_be_bytes())?;
         file.write_all(&(payload.len() as u32).to_be_bytes())?;
         file.write_all(&payload)?;
-        file.sync_all()?;
 
         *self.ops_since_checkpoint.lock() += 1;
+        let mut unsynced = self.unsynced_writes.lock();
+        *unsynced += 1;
+        if *unsynced >= WAL_SYNC_BATCH {
+            file.sync_all()?;
+            *unsynced = 0;
+        }
+
         Ok(lsn)
+    }
+
+    /// Force WAL data to durable storage (used before checkpoint/truncate).
+    pub fn flush(&self) -> crate::error::Result<()> {
+        let mut file = self.file.lock();
+        file.sync_all()?;
+        *self.unsynced_writes.lock() = 0;
+        Ok(())
     }
 
     pub fn should_checkpoint(&self) -> bool {
@@ -137,6 +154,7 @@ impl WriteAheadLog {
     }
 
     pub fn mark_checkpoint(&self, lsn: u64) -> crate::error::Result<()> {
+        self.flush()?;
         let state = CheckpointState { lsn };
         let encoded = bincode::serialize(&state)
             .map_err(|e| crate::error::MoodengError::Storage(e.to_string()))?;
@@ -188,7 +206,8 @@ impl WriteAheadLog {
     }
 
     pub fn truncate(&self) -> crate::error::Result<()> {
-        let mut file = OpenOptions::new()
+        self.flush()?;
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
