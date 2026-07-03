@@ -330,3 +330,71 @@ fn wal_batch_sync_survives_checkpoint() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn row_count(db: &Database, table: &str) -> usize {
+    db.execute(&format!("SELECT * FROM {table}"))
+        .unwrap()
+        .rows
+        .len()
+}
+
+#[test]
+fn crash_before_commit_discards_uncommitted_insert() {
+    let dir = temp_data_dir();
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        let mut session = Session::new();
+        db.execute_session(&mut session, "BEGIN").unwrap();
+        db.execute_session(&mut session, "INSERT INTO t VALUES (1, 'lost')")
+            .unwrap();
+        db.flush_wal().unwrap();
+    }
+
+    let db = Database::open(&dir).unwrap();
+    assert_eq!(row_count(&db, "t"), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_after_commit_persists_insert() {
+    let dir = temp_data_dir();
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        let mut session = Session::new();
+        db.execute_session(&mut session, "BEGIN").unwrap();
+        db.execute_session(&mut session, "INSERT INTO t VALUES (1, 'kept')")
+            .unwrap();
+        db.execute_session(&mut session, "COMMIT").unwrap();
+        db.flush_wal().unwrap();
+    }
+
+    let db = Database::open(&dir).unwrap();
+    assert_eq!(row_count(&db, "t"), 1);
+    let result = db.execute("SELECT v FROM t WHERE id = 1").unwrap();
+    assert_eq!(result.rows[0].values[0].to_display_string(), "kept");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_after_rollback_discards_insert() {
+    let dir = temp_data_dir();
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        let mut session = Session::new();
+        db.execute_session(&mut session, "BEGIN").unwrap();
+        db.execute_session(&mut session, "INSERT INTO t VALUES (1, 'rolled')")
+            .unwrap();
+        db.execute_session(&mut session, "ROLLBACK").unwrap();
+        db.flush_wal().unwrap();
+    }
+
+    let db = Database::open(&dir).unwrap();
+    assert_eq!(row_count(&db, "t"), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

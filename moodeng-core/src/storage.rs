@@ -125,7 +125,14 @@ impl StorageEngine {
         Ok(())
     }
 
-    pub fn insert(&self, table: &str, row: Row) -> crate::error::Result<RowId> {
+    pub fn ensure_table(&self, table: &str) {
+        self.tables
+            .write()
+            .entry(table.to_string())
+            .or_insert_with(TableData::default);
+    }
+
+    pub fn insert(&self, table: &str, row: Row, txn_id: u64) -> crate::error::Result<RowId> {
         let mut tables = self.tables.write();
         let data = tables
             .entry(table.to_string())
@@ -137,6 +144,7 @@ impl StorageEngine {
         drop(tables);
 
         self.wal.append(WalOp::Insert {
+            txn_id,
             table: table.to_string(),
             row_id: id,
             row,
@@ -151,6 +159,7 @@ impl StorageEngine {
         row_id: RowId,
         row: Row,
         log: bool,
+        txn_id: u64,
     ) -> crate::error::Result<()> {
         let mut tables = self.tables.write();
         let data = tables
@@ -164,6 +173,7 @@ impl StorageEngine {
 
         if log {
             self.wal.append(WalOp::Insert {
+                txn_id,
                 table: table.to_string(),
                 row_id,
                 row,
@@ -182,10 +192,9 @@ impl StorageEngine {
 
     pub fn scan(&self, table: &str) -> crate::error::Result<Vec<(RowId, Row)>> {
         let tables = self.tables.read();
-        let data = tables
-            .get(table)
-            .ok_or_else(|| crate::error::MoodengError::TableNotFound(table.into()))?;
-
+        let Some(data) = tables.get(table) else {
+            return Ok(Vec::new());
+        };
         let mut rows: Vec<_> = data.rows.iter().map(|(&id, row)| (id, row.clone())).collect();
         rows.sort_by_key(|(id, _)| *id);
         Ok(rows)
@@ -210,7 +219,7 @@ impl StorageEngine {
         Ok(rows)
     }
 
-    pub fn update(&self, table: &str, id: RowId, row: Row) -> crate::error::Result<bool> {
+    pub fn update(&self, table: &str, id: RowId, row: Row, txn_id: u64) -> crate::error::Result<bool> {
         let mut tables = self.tables.write();
         let data = tables
             .get_mut(table)
@@ -219,6 +228,7 @@ impl StorageEngine {
         if data.rows.insert(id, row.clone()).is_some() {
             drop(tables);
             self.wal.append(WalOp::Update {
+                txn_id,
                 table: table.to_string(),
                 row_id: id,
                 row,
@@ -236,6 +246,7 @@ impl StorageEngine {
         id: RowId,
         row: Row,
         log: bool,
+        txn_id: u64,
     ) -> crate::error::Result<bool> {
         let mut tables = self.tables.write();
         let data = tables
@@ -247,6 +258,7 @@ impl StorageEngine {
 
         if updated && log {
             self.wal.append(WalOp::Update {
+                txn_id,
                 table: table.to_string(),
                 row_id: id,
                 row,
@@ -256,7 +268,7 @@ impl StorageEngine {
         Ok(updated)
     }
 
-    pub fn delete(&self, table: &str, id: RowId) -> crate::error::Result<bool> {
+    pub fn delete(&self, table: &str, id: RowId, txn_id: u64) -> crate::error::Result<bool> {
         let mut tables = self.tables.write();
         let data = tables
             .get_mut(table)
@@ -265,6 +277,7 @@ impl StorageEngine {
         if data.rows.remove(&id).is_some() {
             drop(tables);
             self.wal.append(WalOp::Delete {
+                txn_id,
                 table: table.to_string(),
                 row_id: id,
             })?;
@@ -275,7 +288,7 @@ impl StorageEngine {
         }
     }
 
-    pub fn apply_delete(&self, table: &str, id: RowId, log: bool) -> crate::error::Result<bool> {
+    pub fn apply_delete(&self, table: &str, id: RowId, log: bool, txn_id: u64) -> crate::error::Result<bool> {
         let mut tables = self.tables.write();
         let data = tables
             .get_mut(table)
@@ -286,6 +299,7 @@ impl StorageEngine {
 
         if deleted && log {
             self.wal.append(WalOp::Delete {
+                txn_id,
                 table: table.to_string(),
                 row_id: id,
             })?;

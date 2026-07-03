@@ -48,6 +48,10 @@ impl Database {
             indexes.load_all(snapshot.indexes);
         }
 
+        for table in catalog.list_tables() {
+            storage.ensure_table(&table);
+        }
+
         let replayed = replay_wal(&storage, &wal)?;
         if replayed > 0 {
             tracing::info!("replayed {replayed} WAL entries");
@@ -143,6 +147,11 @@ impl Database {
 
     pub fn wal(&self) -> &Arc<WriteAheadLog> {
         &self.wal
+    }
+
+    /// Flush WAL to disk — useful for crash-recovery tests and durability guarantees.
+    pub fn flush_wal(&self) -> crate::error::Result<()> {
+        self.wal.flush()
     }
 
     pub fn data_dir(&self) -> &Path {

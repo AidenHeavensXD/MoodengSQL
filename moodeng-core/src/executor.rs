@@ -114,7 +114,8 @@ impl<'a> Executor<'a> {
                 "transaction already active".into(),
             ));
         }
-        self.session.transaction.begin();
+        self.session.auto_commit = false;
+        self.session.transaction.begin(self.storage.wal())?;
         Ok(QueryResult::modified(0, "BEGIN"))
     }
 
@@ -124,7 +125,8 @@ impl<'a> Executor<'a> {
                 "no active transaction".into(),
             ));
         }
-        self.session.transaction.commit();
+        self.session.auto_commit = false;
+        self.session.transaction.commit(self.storage.wal())?;
         Ok(QueryResult::modified(0, "COMMIT"))
     }
 
@@ -134,11 +136,29 @@ impl<'a> Executor<'a> {
                 "no active transaction".into(),
             ));
         }
-        let records = self.session.transaction.rollback();
+        self.session.auto_commit = false;
+        let records = self.session.transaction.rollback(self.storage.wal())?;
         for record in records {
             apply_undo(self.storage, self.indexes, self.catalog, &record)?;
         }
         Ok(QueryResult::modified(0, "ROLLBACK"))
+    }
+
+    fn begin_write_txn(&mut self) -> crate::error::Result<u64> {
+        if let Some(txn_id) = self.session.transaction.current_txn_id() {
+            return Ok(txn_id);
+        }
+        self.session.transaction.begin(self.storage.wal())?;
+        self.session.auto_commit = true;
+        Ok(self.session.transaction.current_txn_id().unwrap())
+    }
+
+    fn finish_auto_commit_if_needed(&mut self) -> crate::error::Result<()> {
+        if self.session.auto_commit {
+            self.session.transaction.commit(self.storage.wal())?;
+            self.session.auto_commit = false;
+        }
+        Ok(())
     }
 
     fn create_table(
@@ -162,6 +182,7 @@ impl<'a> Executor<'a> {
             }
         }
         self.catalog.create_table(table.clone(), col_defs.clone())?;
+        self.storage.ensure_table(&table);
         self.create_primary_key_index(&table, &col_defs)?;
         Ok(QueryResult::ddl(format!("CREATE TABLE {table}")))
     }
@@ -229,6 +250,7 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let rows = values_from_insert(source)?;
         let mut count = 0u64;
+        let txn_id = self.begin_write_txn()?;
 
         for values in rows {
             let mut row_values = Vec::with_capacity(schema.columns.len());
@@ -239,11 +261,13 @@ impl<'a> Executor<'a> {
 
             Self::validate_row(&schema, &row_values)?;
 
-            let row_id = self.storage.insert(table, Row::new(row_values.clone()))?;
+            let row_id = self
+                .storage
+                .insert(table, Row::new(row_values.clone()), txn_id)?;
             self.indexes
                 .insert_row(table, &row_values, &col_names, row_id)?;
 
-            if self.session.transaction.is_active() {
+            if self.session.transaction.is_active() && !self.session.auto_commit {
                 self.session.transaction.record(UndoRecord::Insert {
                     table: table.to_string(),
                     row_id,
@@ -252,6 +276,7 @@ impl<'a> Executor<'a> {
             count += 1;
         }
 
+        self.finish_auto_commit_if_needed()?;
         Ok(QueryResult::modified(count, format!("INSERT 0 {count}")))
     }
 
@@ -493,6 +518,7 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
         let mut count = 0u64;
+        let txn_id = self.begin_write_txn()?;
 
         for (id, mut row) in all_rows {
             let should_update = match where_clause {
@@ -501,7 +527,7 @@ impl<'a> Executor<'a> {
             };
 
             if should_update {
-                if self.session.transaction.is_active() {
+                if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Update {
                         table: table.to_string(),
                         row_id: id,
@@ -519,12 +545,13 @@ impl<'a> Executor<'a> {
 
                 Self::validate_row(&schema, &row.values)?;
 
-                self.storage.update(table, id, row.clone())?;
+                self.storage.update(table, id, row.clone(), txn_id)?;
                 self.indexes.insert_row(table, &row.values, &col_names, id)?;
                 count += 1;
             }
         }
 
+        self.finish_auto_commit_if_needed()?;
         Ok(QueryResult::modified(count, format!("UPDATE {count}")))
     }
 
@@ -539,6 +566,7 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
         let mut count = 0u64;
+        let txn_id = self.begin_write_txn()?;
 
         for (id, row) in all_rows {
             let should_delete = match where_clause {
@@ -547,7 +575,7 @@ impl<'a> Executor<'a> {
             };
 
             if should_delete {
-                if self.session.transaction.is_active() {
+                if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Delete {
                         table: table.to_string(),
                         row_id: id,
@@ -556,11 +584,12 @@ impl<'a> Executor<'a> {
                 }
 
                 self.indexes.remove_row(table, &row.values, &col_names, id);
-                self.storage.delete(table, id)?;
+                self.storage.delete(table, id, txn_id)?;
                 count += 1;
             }
         }
 
+        self.finish_auto_commit_if_needed()?;
         Ok(QueryResult::modified(count, format!("DELETE {count}")))
     }
 
