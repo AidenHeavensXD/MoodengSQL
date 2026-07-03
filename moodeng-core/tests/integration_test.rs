@@ -227,3 +227,32 @@ fn substitute_params_replaces_placeholders() {
     assert!(out.contains("42"));
     assert!(out.contains("'alice'"));
 }
+
+#[test]
+fn backup_and_restore_roundtrip() {
+    use moodeng_core::{backup_live, restore, Database};
+
+    let src = temp_data_dir();
+    let dst = temp_data_dir();
+    let archive = std::env::temp_dir().join(format!("moodeng_backup_{}.tar.gz", uuid::Uuid::new_v4()));
+
+    {
+        let db = Database::open(&src).unwrap();
+        db.execute("CREATE TABLE items (id INT PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'alpha')").unwrap();
+        backup_live(&db, &archive).unwrap();
+    }
+
+    restore(&dst, &archive).unwrap();
+
+    {
+        let db = Database::open(&dst).unwrap();
+        assert_eq!(db.catalog.list_tables(), vec!["items"]);
+        let result = db.execute("SELECT label FROM items WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0].values[0].to_display_string(), "alpha");
+    }
+
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::remove_file(&archive);
+}

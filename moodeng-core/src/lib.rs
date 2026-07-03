@@ -4,6 +4,7 @@
 //!
 //! **Owner:** AidenHeavensXD
 
+pub mod backup;
 pub mod catalog;
 pub mod engine;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod transaction;
 pub mod types;
 pub mod wal;
 
+pub use backup::{backup, backup_live, list_backup_files, restore};
 pub use engine::Database;
 pub use error::{MoodengError, Result};
 pub use transaction::Session;

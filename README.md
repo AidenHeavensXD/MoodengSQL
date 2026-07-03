@@ -21,6 +21,11 @@ MoodengSQL is a blazing-fast, PostgreSQL-inspired relational database engine wri
 - **Table-level locking** — concurrent connections with read/write locks
 - **Constraints** — PRIMARY KEY (auto-index) and NOT NULL enforcement
 - **Data validation** — `moodengsql --check` verifies catalog/storage consistency
+- **Configuration** — `moodeng.toml` for server, storage, and logging
+- **Backup / restore** — gzip tar archives of the data directory
+- **Health check** — `moodengsql ping` for load balancers and Docker
+- **Docker** — Dockerfile and docker-compose for container deployment
+- **CI** — GitHub Actions runs tests and release builds
 - **Concurrent catalog** — lock-free table metadata via DashMap
 - **Rich types** — INT4, INT8, FLOAT4, FLOAT8, TEXT, VARCHAR, BOOL, TIMESTAMP, JSON
 
@@ -76,14 +81,37 @@ moodengsql/
 
 ## Server Options
 
-```
-moodengsql [OPTIONS]
+MoodengSQL uses subcommands for operations. Legacy flat flags still work for `serve`:
 
-Options:
-  -p, --port <PORT>          TCP port [default: 5432]
-  -d, --data-dir <DATA_DIR>  Data directory [default: ./moodeng_data]
-      --host <HOST>          Bind address [default: 127.0.0.1]
+```bash
+# Start server (subcommand or legacy)
+moodengsql serve --data-dir ./moodeng_data
+moodengsql --data-dir ./moodeng_data --port 5432
+
+# With config file
+moodengsql serve --config moodeng.toml
+
+# Validate data directory
+moodengsql check --data-dir ./moodeng_data
+
+# Backup and restore
+moodengsql backup --output backup.tar.gz --data-dir ./moodeng_data
+moodengsql restore --from backup.tar.gz --data-dir ./moodeng_data
+
+# Health check
+moodengsql ping --host 127.0.0.1 --port 5432
 ```
+
+Copy `moodeng.toml.example` to `moodeng.toml` to customize host, port, data directory, and log level.
+
+## Docker
+
+```bash
+docker compose up -d --build
+docker compose exec moodengsql moodeng ping --config /etc/moodengsql/moodeng.toml
+```
+
+Data is persisted in the `moodeng_data` Docker volume at `/data`.
 
 ## CLI Options
 

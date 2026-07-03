@@ -1,0 +1,17 @@
+services:
+  moodengsql:
+    build: .
+    image: moodengsql:latest
+    ports:
+      - "5432:5432"
+    volumes:
+      - moodeng_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "moodengsql", "ping", "--config", "/etc/moodengsql/moodeng.toml"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  moodeng_data:
