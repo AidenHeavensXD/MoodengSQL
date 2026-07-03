@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod metrics;
 mod protocol;
 mod scram;
 mod session;
@@ -12,11 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn, Level};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use auth::{hash_password, hash_scram, AuthConfig};
-use config::Config;
+use config::{Config, LogFormat, QueryLogConfig};
+use metrics::ServerMetrics;
 use tls::TlsSettings;
 
 #[derive(Parser, Debug)]
@@ -136,10 +139,57 @@ fn init_logging(cfg: &Config) {
         "error" => Level::ERROR,
         _ => Level::INFO,
     };
-    let _ = FmtSubscriber::builder()
+    let builder = FmtSubscriber::builder()
         .with_max_level(level)
-        .with_target(false)
-        .try_init();
+        .with_target(false);
+    let _ = match cfg.log.format {
+        LogFormat::Json => builder.json().flatten_event(true).try_init(),
+        LogFormat::Text => builder.try_init(),
+    };
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C"),
+        _ = terminate => info!("Received SIGTERM"),
+    }
+}
+
+async fn drain_connections(metrics: &ServerMetrics, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = metrics.active_connections();
+        if remaining == 0 {
+            info!("All client connections closed");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                active_connections = remaining,
+                "Shutdown timeout elapsed with active connections still open"
+            );
+            return;
+        }
+        debug!(active_connections = remaining, "Waiting for connections to drain");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::main]
@@ -302,6 +352,8 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     let port = args.port.unwrap_or(cfg.server.port);
     let data_dir = data_dir(cfg, args.data_dir.clone());
     let max_connections = args.max_connections.unwrap_or(cfg.server.max_connections);
+    let shutdown_timeout = Duration::from_secs(cfg.server.shutdown_timeout_secs);
+    let query_log = QueryLogConfig::from(&cfg.log);
     let tls_settings = TlsSettings::from_server_config(&cfg.server);
     let tls_acceptor = tls_settings
         .load_server_config()?
@@ -337,32 +389,110 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     info!("╚══════════════════════════════════════════╝");
     info!("Data directory: {}", data_dir.display());
     info!("Max connections: {max_connections}");
+    info!("Slow query threshold: {} ms", query_log.slow_query_ms);
+    info!("Shutdown drain timeout: {} s", shutdown_timeout.as_secs());
+
+    let metrics = Arc::new(ServerMetrics::new());
+    let (metrics_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    if cfg.server.metrics_port > 0 {
+        let metrics_addr = format!("{}:{}", cfg.server.metrics_host, cfg.server.metrics_port);
+        let metrics_db = Arc::clone(&db);
+        let metrics_arc = Arc::clone(&metrics);
+        let metrics_shutdown = metrics_shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve_http(&metrics_addr, metrics_arc, metrics_db, metrics_shutdown).await
+            {
+                warn!(error = %e, "Metrics server stopped");
+            }
+        });
+    }
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {addr}");
 
-    let connection_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let connection_limit = Arc::new(Semaphore::new(max_connections));
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let db = Arc::clone(&db);
-        let auth = Arc::clone(&auth);
-        let tls_settings = tls_settings.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let permit = Arc::clone(&connection_limit);
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, peer) = accept_result?;
+                let db = Arc::clone(&db);
+                let auth = Arc::clone(&auth);
+                let tls_settings = tls_settings.clone();
+                let tls_acceptor = tls_acceptor.clone();
+                let connection_limit = Arc::clone(&connection_limit);
+                let metrics = Arc::clone(&metrics);
 
-        tokio::spawn(async move {
-            let _permit = match permit.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            info!("Connection from {peer}");
-            if let Err(e) =
-                protocol::handle_connection(stream, db, auth, tls_settings, tls_acceptor).await
-            {
-                tracing::debug!("Connection closed: {e}");
+                let permit = match connection_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        metrics.connection_rejected();
+                        warn!(peer = %peer, "Connection rejected: max_connections reached");
+                        drop(stream);
+                        continue;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => break,
+                };
+
+                metrics.connection_accepted();
+                info!(peer = %peer, "Connection accepted");
+
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _guard = ActiveConnectionGuard::new(metrics.clone());
+                    if let Err(e) = protocol::handle_connection(
+                        stream,
+                        peer,
+                        db,
+                        auth,
+                        tls_settings,
+                        tls_acceptor,
+                        query_log,
+                        metrics,
+                    )
+                    .await
+                    {
+                        debug!(peer = %peer, error = %e, "Connection closed with error");
+                    }
+                });
             }
-        });
+            _ = shutdown_signal() => {
+                info!("Graceful shutdown started — no longer accepting connections");
+                break;
+            }
+        }
+    }
+
+    drop(listener);
+    connection_limit.close();
+    let _ = metrics_shutdown_tx.send(());
+    drain_connections(&metrics, shutdown_timeout).await;
+
+    if let Err(e) = db.checkpoint() {
+        warn!(error = %e, "Final checkpoint failed during shutdown");
+    } else {
+        info!("Final checkpoint completed");
+    }
+
+    info!("Server stopped");
+    Ok(())
+}
+
+struct ActiveConnectionGuard {
+    metrics: Arc<ServerMetrics>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics.connection_opened();
+        Self { metrics }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.connection_closed();
     }
 }

@@ -1,15 +1,20 @@
 use bytes::{Buf, BufMut, BytesMut};
 use moodeng_core::{substitute_params, Database, QueryResult};
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
+use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
+use crate::config::QueryLogConfig;
+use crate::metrics::ServerMetrics;
 use crate::scram::{ScramSession, SCRAM_SHA256};
 use crate::session::ConnectionSession;
 use crate::tls::TlsSettings;
@@ -115,13 +120,16 @@ impl AsyncWrite for ClientStream {
 
 pub async fn handle_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     db: Arc<Database>,
     auth: Arc<AuthConfig>,
     tls: TlsSettings,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
+    query_log: QueryLogConfig,
+    metrics: Arc<ServerMetrics>,
 ) -> anyhow::Result<()> {
     let (client, encrypted) = negotiate_stream(stream, &tls, tls_acceptor.as_ref()).await?;
-    run_session(client, db, auth, encrypted).await
+    run_session(client, peer, db, auth, encrypted, query_log, metrics).await
 }
 
 async fn negotiate_stream(
@@ -175,10 +183,14 @@ async fn negotiate_stream(
 
 async fn run_session(
     mut stream: ClientStream,
+    peer: SocketAddr,
     db: Arc<Database>,
     auth: Arc<AuthConfig>,
     encrypted: bool,
+    query_log: QueryLogConfig,
+    metrics: Arc<ServerMetrics>,
 ) -> anyhow::Result<()> {
+    let session_start = Instant::now();
     let len = stream.read_i32().await? as usize;
     let mut buf = vec![0u8; len.saturating_sub(4)];
     stream.read_exact(&mut buf).await?;
@@ -237,13 +249,13 @@ async fn run_session(
                 if sql.is_empty() {
                     continue;
                 }
-                run_sql(&mut stream, &db, &mut conn, &sql).await?;
+                run_sql(&mut stream, &db, &mut conn, &sql, peer, query_log, &metrics).await?;
                 send_ready(&mut stream, &conn).await?;
             }
             b'P' => handle_parse(&mut conn, &payload)?,
             b'B' => handle_bind(&mut conn, &payload)?,
             b'E' => {
-                handle_execute(&mut stream, &db, &mut conn, &payload).await?;
+                handle_execute(&mut stream, &db, &mut conn, &payload, peer, query_log, &metrics).await?;
             }
             b'S' => {
                 conn.in_error = false;
@@ -253,6 +265,12 @@ async fn run_session(
             _ => {}
         }
     }
+
+    info!(
+        peer = %peer,
+        duration_ms = session_start.elapsed().as_millis() as u64,
+        "Connection closed"
+    );
 
     Ok(())
 }
@@ -381,21 +399,96 @@ async fn run_sql<S>(
     db: &Arc<Database>,
     conn: &mut ConnectionSession,
     sql: &str,
+    peer: SocketAddr,
+    query_log: QueryLogConfig,
+    metrics: &ServerMetrics,
 ) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    let started = Instant::now();
+    let sql_preview = summarize_sql(sql);
     match db.execute_session(&mut conn.session, sql) {
         Ok(result) => {
             conn.in_error = false;
+            log_query_outcome(peer, &sql_preview, started, query_log, &result, None, metrics);
             send_query_result(stream, &result).await?;
         }
         Err(e) => {
             conn.in_error = true;
+            log_query_outcome(
+                peer,
+                &sql_preview,
+                started,
+                query_log,
+                &QueryResult::empty(""),
+                Some(&e),
+                metrics,
+            );
             send_error(stream, &e.to_string()).await?;
         }
     }
     Ok(())
+}
+
+fn summarize_sql(sql: &str) -> String {
+    let one_line = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.len() <= 200 {
+        one_line
+    } else {
+        format!("{}…", &one_line[..200])
+    }
+}
+
+fn log_query_outcome(
+    peer: SocketAddr,
+    sql: &str,
+    started: Instant,
+    query_log: QueryLogConfig,
+    result: &QueryResult,
+    error: Option<&moodeng_core::MoodengError>,
+    metrics: &ServerMetrics,
+) {
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let rows = if result.rows.is_empty() {
+        result.rows_affected
+    } else {
+        result.rows.len() as u64
+    };
+
+    if let Some(err) = error {
+        metrics.query_failed(duration_ms);
+        warn!(
+            peer = %peer,
+            duration_ms,
+            rows,
+            error = %err,
+            sql,
+            "query failed"
+        );
+        return;
+    }
+
+    let slow = duration_ms >= query_log.slow_query_ms;
+    metrics.query_executed(duration_ms, slow);
+
+    if slow {
+        warn!(
+            peer = %peer,
+            duration_ms,
+            rows,
+            sql,
+            "slow query"
+        );
+    } else {
+        debug!(
+            peer = %peer,
+            duration_ms,
+            rows,
+            sql,
+            "query executed"
+        );
+    }
 }
 
 fn handle_parse(conn: &mut ConnectionSession, payload: &[u8]) -> anyhow::Result<()> {
@@ -454,6 +547,9 @@ async fn handle_execute<S>(
     db: &Arc<Database>,
     conn: &mut ConnectionSession,
     payload: &[u8],
+    peer: SocketAddr,
+    query_log: QueryLogConfig,
+    metrics: &ServerMetrics,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -467,7 +563,7 @@ where
     }
 
     let final_sql = substitute_params(&sql, &conn.portal_params);
-    run_sql(stream, db, conn, &final_sql).await?;
+    run_sql(stream, db, conn, &final_sql, peer, query_log, metrics).await?;
     Ok(())
 }
 
@@ -593,6 +689,7 @@ fn read_cstring_buf(cur: &mut &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::auth::{hash_password, AuthConfig};
+    use crate::metrics::ServerMetrics;
     use crate::tls::test_util::generate_test_tls;
     use tokio_rustls::rustls::RootCertStore;
     use tokio_rustls::TlsConnector;
@@ -606,7 +703,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok((stream, peer)) = listener.accept().await else {
                     break;
                 };
                 let db = Arc::new(Database::in_memory().unwrap());
@@ -614,7 +711,18 @@ mod tests {
                 let tls = tls.clone();
                 let acc = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, db, auth, tls, acc).await;
+                    let metrics = Arc::new(ServerMetrics::new());
+                    let _ = handle_connection(
+                        stream,
+                        peer,
+                        db,
+                        auth,
+                        tls,
+                        acc,
+                        QueryLogConfig { slow_query_ms: 1000 },
+                        metrics,
+                    )
+                    .await;
                 });
             }
         });

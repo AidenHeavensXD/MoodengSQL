@@ -5,6 +5,9 @@
 host = "0.0.0.0"
 port = 5432
 max_connections = 100
+shutdown_timeout_secs = 30
+metrics_host = "127.0.0.1"
+metrics_port = 9090
 # tls_cert = "/path/to/cert.pem"
 # tls_key = "/path/to/key.pem"
 # require_tls = false
@@ -16,6 +19,8 @@ data_dir = "./moodeng_data"
 
 [log]
 level = "info"
+slow_query_ms = 1000
+# format = "json"   # text (default) or json for log aggregators
 
 [auth]
 # Generate with: moodengsql hash-password "your-password"

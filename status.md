@@ -19,8 +19,8 @@ cargo test --workspace
 # moodeng-core unit:           3 passed
 # moodeng-core integration:   28 passed
 # moodeng-core proptest:       4 passed
-# moodeng-server auth+TLS+SCRAM: 10 passed
-# Total: 45 tests, 0 failed
+# moodeng-server:             13 passed
+# Total: 48 tests, 0 failed
 ```
 
 **Benchmark regression smoke:**
@@ -39,7 +39,7 @@ MOODENG_BENCH_MIN_INSERT=500 MOODENG_BENCH_MIN_SELECT=500 \
 | Phase 2 — SQL + extended protocol | ✅ Done (SCRAM + upsert) |
 | Phase 3 — Deploy & operations | ✅ Done |
 | Phase 4 — Performance & hardening | ✅ Done |
-| **Production MVP** | ✅ **Ready locally** |
+| **Production MVP** | ✅ **Ready** (+ ops hardening) |
 
 ---
 
@@ -56,6 +56,38 @@ MOODENG_BENCH_MIN_INSERT=500 MOODENG_BENCH_MIN_SELECT=500 \
 | 7 | Row lock DashMap cleanup | ✅ | 100k lock/unlock test |
 | 8 | Benchmark regression in CI | ✅ | `.github/workflows/ci.yml` |
 | 9 | INSERT ON CONFLICT (upsert) | ✅ **2026-07-03** | 4 upsert integration tests |
+| 10 | Graceful shutdown (SIGTERM/Ctrl+C) | ✅ **2026-07-03** | drain + final checkpoint |
+| 11 | Connection limit (immediate reject) | ✅ **2026-07-03** | `try_acquire` on accept |
+| 12 | Structured query logging | ✅ **2026-07-03** | slow query WARN, query DEBUG |
+| 13 | Prometheus `/metrics` HTTP | ✅ **2026-07-03** | `metrics_port = 9090` |
+
+---
+
+## Operations Hardening (completed 2026-07-03)
+
+| Feature | Config | Detail |
+|---------|--------|--------|
+| Graceful shutdown | `shutdown_timeout_secs = 30` | SIGTERM / Ctrl+C → drain → checkpoint |
+| Connection cap | `max_connections = 100` | Rejects immediately when full (no queue) |
+| Slow query log | `slow_query_ms = 1000` | WARN with peer, duration, rows, sql |
+| Query trace | `level = "debug"` | Every query at DEBUG |
+| JSON logs | `format = "json"` | For Loki / ELK / CloudWatch |
+| Prometheus metrics | `metrics_port = 9090` | `curl localhost:9090/metrics` |
+
+```toml
+[server]
+max_connections = 100
+shutdown_timeout_secs = 30
+metrics_host = "127.0.0.1"
+metrics_port = 9090
+
+[log]
+level = "info"
+slow_query_ms = 1000
+format = "json"   # optional
+```
+
+**Prometheus series:** `moodeng_up`, `moodeng_connections_active`, `moodeng_queries_total`, `moodeng_query_errors_total`, `moodeng_slow_queries_total`, `moodeng_tables`
 
 ---
 
@@ -92,7 +124,7 @@ INSERT INTO users (id, name) VALUES (1, 'Bob')
 | INSERT ON CONFLICT | ✅ |
 | **All tests pass in CI** | ⚠️ verify on GitHub after push |
 
-**Overall:** Production MVP complete locally (45 tests).
+**Overall:** Production MVP complete (47 tests). Ops hardening for confident deploy.
 
 ---
 
@@ -102,28 +134,23 @@ Do these once before pointing production apps at MoodengSQL:
 
 | Step | Action | Why |
 |------|--------|-----|
-| 1 | Push + confirm [GitHub Actions](https://github.com/AidenHeavensXD/MoodengSQL/actions) green | CI is the source of truth |
-| 2 | Set `password_scram` + `require_tls = true` in `moodeng.toml` | No cleartext passwords on the wire |
+| 1 | Confirm [GitHub Actions](https://github.com/AidenHeavensXD/MoodengSQL/actions) green | CI is the source of truth |
+| 2 | Set `password_scram` + `require_tls = true` | No cleartext passwords on the wire |
 | 3 | Use real TLS cert (Let's Encrypt / internal CA) | Self-signed breaks most clients |
-| 4 | Set `[storage] max_cached_pages = 64` (or higher) for large tables | Avoid loading entire table into RAM |
-| 5 | Schedule `moodengsql backup` (cron) + test restore on staging | Prove DR works |
-| 6 | Run `moodengsql --check` after deploy | Catalog/storage consistency |
-| 7 | Set `MOODENG_PASSWORD` via secrets manager, not shell history | Credential hygiene |
-| 8 | Monitor disk usage on data dir + WAL | WAL grows until checkpoint |
+| 4 | Set `[storage] max_cached_pages = 64` (or higher) | Avoid loading entire table into RAM |
+| 5 | Set `[log] format = "json"` + ship logs to aggregator | Debug production issues |
+| 6 | Tune `max_connections` + `slow_query_ms` for your workload | Prevent OOM, catch regressions |
+| 7 | Schedule `moodengsql backup` (cron) + test restore on staging | Prove DR works |
+| 8 | Run `moodengsql --check` after deploy | Catalog/storage consistency |
+| 9 | Use SIGTERM for deploys (Docker/K8s stop) | Graceful drain + checkpoint |
+| 10 | Monitor disk usage on data dir + WAL | WAL grows until checkpoint |
 
 ---
 
 ## Recommended Next (post-MVP, not blockers)
 
-These improve operability but are **not required** for a first production cut:
-
 | Priority | Item | Notes |
 |----------|------|-------|
-| High | Connection limit + graceful shutdown | Prevent OOM under load spikes |
-| High | Structured logging (request latency, slow queries) | Debug production issues |
-| Medium | `max_connections` config | Wire protocol already async |
-| Medium | Health metrics endpoint (Prometheus) | Beyond `ping` |
-| Medium | Unique-index upsert on non-PK columns | Works if unique index exists |
 | Low | MD5 auth (legacy clients) | SCRAM covers modern psql/libpq |
 | Low | Replication / read replicas | Single-node is fine for MVP |
 | Low | Full PostgreSQL SQL compatibility | Subset is intentional |
@@ -156,7 +183,7 @@ max_cached_pages = 64
 ## Quick Commands
 
 ```bash
-cargo test --workspace          # 45 tests
+cargo test --workspace          # 48 tests
 cargo build --release
 moodengsql serve --config moodeng.toml
 moodengsql hash-password --scram "secret"
@@ -167,4 +194,4 @@ psql "host=127.0.0.1 port=5432 user=moodeng password=secret sslmode=require"
 
 ---
 
-*Updated after INSERT ON CONFLICT upsert (2026-07-03).*
+*Updated after ops hardening: graceful shutdown, connection limits, structured logging (2026-07-03).*

@@ -31,6 +31,15 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Seconds to wait for active connections during graceful shutdown.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+    /// Prometheus metrics HTTP port (0 = disabled). Binds to metrics_host.
+    #[serde(default)]
+    pub metrics_port: u16,
+    /// Host for the Prometheus /metrics HTTP endpoint.
+    #[serde(default = "default_metrics_host")]
+    pub metrics_host: String,
     /// PEM certificate for TLS (PostgreSQL SSLRequest upgrade).
     #[serde(default)]
     pub tls_cert: Option<PathBuf>,
@@ -54,10 +63,37 @@ pub struct StorageConfig {
     pub rows_per_page: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Log queries slower than this threshold at WARN (all queries at DEBUG).
+    #[serde(default = "default_slow_query_ms")]
+    pub slow_query_ms: u64,
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+/// Query logging thresholds passed into the wire protocol layer.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryLogConfig {
+    pub slow_query_ms: u64,
+}
+
+impl From<&LogConfig> for QueryLogConfig {
+    fn from(log: &LogConfig) -> Self {
+        Self {
+            slow_query_ms: log.slow_query_ms,
+        }
+    }
 }
 
 impl Default for Config {
@@ -77,6 +113,9 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             max_connections: default_max_connections(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            metrics_port: 0,
+            metrics_host: default_metrics_host(),
             tls_cert: None,
             tls_key: None,
             require_tls: false,
@@ -98,6 +137,8 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+            slow_query_ms: default_slow_query_ms(),
+            format: LogFormat::default(),
         }
     }
 }
@@ -110,6 +151,15 @@ fn default_port() -> u16 {
 }
 fn default_max_connections() -> usize {
     100
+}
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+fn default_metrics_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_slow_query_ms() -> u64 {
+    1000
 }
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./moodeng_data")
@@ -136,5 +186,24 @@ impl Config {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_config_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.log.level, "info");
+        assert_eq!(cfg.log.slow_query_ms, 1000);
+        assert_eq!(cfg.log.format, LogFormat::Text);
+    }
+
+    #[test]
+    fn server_shutdown_timeout_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.server.shutdown_timeout_secs, 30);
     }
 }
