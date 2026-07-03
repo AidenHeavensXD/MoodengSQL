@@ -23,6 +23,8 @@ pub mod wal;
 
 pub use backup::{backup, backup_live, list_backup_files, restore};
 pub use engine::Database;
+pub use recovery::{checkpoint, replay_wal};
+pub use wal::{encode_wal_entry, replay_from_bytes, WalOp, WriteAheadLog};
 pub use error::{MoodengError, Result};
 pub use transaction::Session;
 pub use query_util::substitute_params;

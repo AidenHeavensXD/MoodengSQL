@@ -11,3 +11,8 @@ data_dir = "./moodeng_data"
 
 [log]
 level = "info"
+
+[auth]
+# Generate with: moodengsql hash-password "your-password"
+# Or set MOODENG_PASSWORD env at runtime (hashed on startup).
+password_hash = ""

@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod protocol;
 mod session;
@@ -9,9 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use auth::{hash_password, AuthConfig};
 use config::Config;
 
 #[derive(Parser, Debug)]
@@ -41,6 +43,11 @@ enum Command {
     Restore(RestoreArgs),
     /// Health check — connect and verify ReadyForQuery
     Ping(PingArgs),
+    /// Print an argon2 hash for moodeng.toml [auth].password_hash
+    HashPassword {
+        /// Plain-text password to hash
+        password: String,
+    },
 }
 
 #[derive(Parser, Debug, Default)]
@@ -86,6 +93,8 @@ struct PingArgs {
     host: Option<String>,
     #[arg(short, long)]
     port: Option<u16>,
+    #[arg(long)]
+    password: Option<String>,
     #[arg(long, default_value_t = 5)]
     timeout_secs: u64,
 }
@@ -100,6 +109,10 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 
 fn data_dir(cfg: &Config, override_dir: Option<PathBuf>) -> PathBuf {
     override_dir.unwrap_or_else(|| cfg.storage.data_dir.clone())
+}
+
+fn auth_config(cfg: &Config) -> AuthConfig {
+    AuthConfig::from_config_and_env(cfg.auth.password_hash.clone())
 }
 
 fn init_logging(cfg: &Config) {
@@ -129,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Backup(args)) => run_backup(&cfg, &args),
         Some(Command::Restore(args)) => run_restore(&cfg, &args),
         Some(Command::Ping(args)) => run_ping(&cfg, &args).await,
+        Some(Command::HashPassword { password }) => {
+            println!("{}", hash_password(&password));
+            Ok(())
+        }
     }
 }
 
@@ -165,23 +182,38 @@ async fn run_ping(cfg: &Config, args: &PingArgs) -> anyhow::Result<()> {
     } else {
         host
     };
+    let password = args
+        .password
+        .clone()
+        .or_else(|| std::env::var("MOODENG_PASSWORD").ok());
 
-    ping(connect_host, port, timeout).await?;
+    ping(connect_host, port, timeout, password.as_deref()).await?;
     info!("ok: {connect_host}:{port} is ready");
     Ok(())
 }
 
-async fn ping(host: &str, port: u16, timeout: Duration) -> anyhow::Result<()> {
+async fn ping(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
     let addr = format!("{host}:{port}");
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
         .await
         .map_err(|_| anyhow::anyhow!("connection timed out after {timeout:?}"))??;
 
-    let mut pkt = Vec::with_capacity(32);
-    pkt.extend_from_slice(&16i32.to_be_bytes());
-    pkt.extend_from_slice(&196608i32.to_be_bytes());
-    pkt.extend_from_slice(b"user\0moodeng\0");
+    let mut body = Vec::new();
+    body.extend_from_slice(&196608i32.to_be_bytes());
+    body.extend_from_slice(b"user\0moodeng\0");
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    pkt.extend_from_slice(&body);
     stream.write_all(&pkt).await?;
+
+    if !read_until_auth_ready(&mut stream, password).await? {
+        anyhow::bail!("authentication failed during ping");
+    }
 
     loop {
         let msg_type = match stream.read_u8().await {
@@ -201,6 +233,46 @@ async fn ping(host: &str, port: u16, timeout: Duration) -> anyhow::Result<()> {
     }
 }
 
+async fn read_until_auth_ready(
+    stream: &mut TcpStream,
+    password: Option<&str>,
+) -> anyhow::Result<bool> {
+    loop {
+        let msg_type = stream.read_u8().await?;
+        let len = stream.read_i32().await? as usize;
+        let mut payload = vec![0u8; len.saturating_sub(4)];
+        if !payload.is_empty() {
+            stream.read_exact(&mut payload).await?;
+        }
+        match msg_type {
+            b'R' => {
+                if payload.len() >= 4 {
+                    let auth_type = i32::from_be_bytes(payload[..4].try_into()?);
+                    if auth_type == 0 {
+                        return Ok(true);
+                    }
+                    if auth_type == 3 {
+                        let pwd = password.unwrap_or("");
+                        let mut body = Vec::new();
+                        body.extend_from_slice(pwd.as_bytes());
+                        body.push(0);
+                        let msg_len = (body.len() + 4) as i32;
+                        stream.write_u8(b'p').await?;
+                        stream.write_i32(msg_len).await?;
+                        stream.write_all(&body).await?;
+                        continue;
+                    }
+                }
+                return Ok(false);
+            }
+            b'E' => return Ok(false),
+            b'S' | b'K' => continue,
+            b'Z' => return Ok(true),
+            _ => continue,
+        }
+    }
+}
+
 async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     if args.check {
         let check = CheckArgs {
@@ -213,6 +285,13 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     let port = args.port.unwrap_or(cfg.server.port);
     let data_dir = data_dir(cfg, args.data_dir.clone());
     let max_connections = args.max_connections.unwrap_or(cfg.server.max_connections);
+    let auth = Arc::new(auth_config(cfg));
+
+    if auth.required() {
+        info!("Password authentication enabled");
+    } else {
+        warn!("No password configured — trust mode (set [auth].password_hash or MOODENG_PASSWORD)");
+    }
 
     let db = Arc::new(Database::open(&data_dir)?);
 
@@ -233,6 +312,7 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let db = Arc::clone(&db);
+        let auth = Arc::clone(&auth);
         let permit = Arc::clone(&connection_limit);
 
         tokio::spawn(async move {
@@ -241,7 +321,7 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
                 Err(_) => return,
             };
             info!("Connection from {peer}");
-            if let Err(e) = protocol::handle_connection(stream, db).await {
+            if let Err(e) = protocol::handle_connection(stream, db, auth).await {
                 tracing::debug!("Connection closed: {e}");
             }
         });

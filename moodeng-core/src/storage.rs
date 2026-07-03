@@ -219,25 +219,42 @@ impl StorageEngine {
         Ok(rows)
     }
 
-    pub fn update(&self, table: &str, id: RowId, row: Row, txn_id: u64) -> crate::error::Result<bool> {
+    pub fn update(
+        &self,
+        table: &str,
+        id: RowId,
+        mut row: Row,
+        txn_id: u64,
+        expected_version: u64,
+    ) -> crate::error::Result<bool> {
         let mut tables = self.tables.write();
         let data = tables
             .get_mut(table)
             .ok_or_else(|| crate::error::MoodengError::TableNotFound(table.into()))?;
 
-        if data.rows.insert(id, row.clone()).is_some() {
-            drop(tables);
-            self.wal.append(WalOp::Update {
-                txn_id,
+        let Some(existing) = data.rows.get(&id) else {
+            return Ok(false);
+        };
+
+        if existing.version != expected_version {
+            return Err(crate::error::MoodengError::VersionConflict {
                 table: table.to_string(),
                 row_id: id,
-                row,
-            })?;
-            self.maybe_checkpoint()?;
-            Ok(true)
-        } else {
-            Ok(false)
+            });
         }
+
+        row.version = expected_version + 1;
+        data.rows.insert(id, row.clone());
+        drop(tables);
+
+        self.wal.append(WalOp::Update {
+            txn_id,
+            table: table.to_string(),
+            row_id: id,
+            row,
+        })?;
+        self.maybe_checkpoint()?;
+        Ok(true)
     }
 
     pub fn apply_update(
@@ -248,24 +265,36 @@ impl StorageEngine {
         log: bool,
         txn_id: u64,
     ) -> crate::error::Result<bool> {
-        let mut tables = self.tables.write();
-        let data = tables
-            .get_mut(table)
-            .ok_or_else(|| crate::error::MoodengError::TableNotFound(table.into()))?;
+        let wal_row = {
+            let mut tables = self.tables.write();
+            let data = tables
+                .get_mut(table)
+                .ok_or_else(|| crate::error::MoodengError::TableNotFound(table.into()))?;
 
-        let updated = data.rows.insert(id, row.clone()).is_some();
-        drop(tables);
+            let Some(existing) = data.rows.get(&id) else {
+                return Ok(false);
+            };
 
-        if updated && log {
+            let mut new_row = row.clone();
+            new_row.version = existing.version + 1;
+            data.rows.insert(id, new_row.clone());
+            if log {
+                Some(new_row)
+            } else {
+                None
+            }
+        };
+
+        if let Some(new_row) = wal_row {
             self.wal.append(WalOp::Update {
                 txn_id,
                 table: table.to_string(),
                 row_id: id,
-                row,
+                row: new_row,
             })?;
             self.maybe_checkpoint()?;
         }
-        Ok(updated)
+        Ok(true)
     }
 
     pub fn delete(&self, table: &str, id: RowId, txn_id: u64) -> crate::error::Result<bool> {

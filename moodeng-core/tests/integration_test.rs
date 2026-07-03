@@ -398,3 +398,77 @@ fn crash_after_rollback_discards_insert() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn wal_torn_last_entry_replays_prior_entries_only() {
+    let dir = temp_data_dir();
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE torn (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("INSERT INTO torn VALUES (1, 'ok')").unwrap();
+        db.execute("INSERT INTO torn VALUES (2, 'maybe')").unwrap();
+        db.flush_wal().unwrap();
+    }
+
+    let wal_path = dir.join("wal.log");
+    let mut raw = std::fs::read(&wal_path).unwrap();
+    assert!(raw.len() > 16);
+    raw.truncate(raw.len().saturating_sub(6));
+    std::fs::write(&wal_path, &raw).unwrap();
+
+    let entries = moodeng_core::replay_from_bytes(&raw, 0);
+    assert!(!entries.is_empty());
+
+    let db = Database::open(&dir).unwrap();
+    let count = row_count(&db, "torn");
+    assert!(count >= 1, "expected at least first committed row, got {count}");
+    assert!(count <= 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fifty_concurrent_row_inserts() {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    let dir = temp_data_dir();
+    let db = Arc::new(Database::open(&dir).unwrap());
+    db.execute("CREATE TABLE concurrent (id INT PRIMARY KEY, client INT)")
+        .unwrap();
+
+    let clients = 50;
+    let rows_per_client = 10;
+    let start = Instant::now();
+    let mut handles = Vec::new();
+
+    for client in 0..clients {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            for n in 0..rows_per_client {
+                let id = client * 1000 + n;
+                db.execute(&format!(
+                    "INSERT INTO concurrent VALUES ({id}, {client})"
+                ))
+                .unwrap();
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let total = clients * rows_per_client;
+    let rate = total as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "row-level concurrency: {clients} clients x {rows_per_client} inserts in {elapsed:?} ({rate:.0} rows/s)"
+    );
+
+    let count = db.execute("SELECT * FROM concurrent").unwrap().rows.len();
+    assert_eq!(count, total);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -168,7 +168,7 @@ impl<'a> Executor<'a> {
         constraints: &[sqlparser::ast::TableConstraint],
     ) -> crate::error::Result<QueryResult> {
         let table = extract_table_name(name);
-        let lock = self.locks.lock_for(&table);
+        let lock = self.locks.ddl_lock_for(&table);
         let _guard = lock.write();
         let mut col_defs: Vec<ColumnDef> = columns
             .iter()
@@ -235,7 +235,7 @@ impl<'a> Executor<'a> {
     }
 
     fn drop_table(&self, table: &str) -> crate::error::Result<QueryResult> {
-        let lock = self.locks.lock_for(table);
+        let lock = self.locks.ddl_lock_for(table);
         let _guard = lock.write();
         self.catalog.drop_table(table)?;
         self.storage.drop_table(table)?;
@@ -244,8 +244,6 @@ impl<'a> Executor<'a> {
     }
 
     fn insert(&mut self, table: &str, source: &Query) -> crate::error::Result<QueryResult> {
-        let lock = self.locks.lock_for(table);
-        let _guard = lock.write();
         let schema = self.catalog.get_table(table)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let rows = values_from_insert(source)?;
@@ -298,8 +296,6 @@ impl<'a> Executor<'a> {
             .ok_or_else(|| crate::error::MoodengError::Parse("missing FROM".into()))?;
         let where_clause = select.selection.clone();
 
-        let lock = self.locks.lock_for(&table_name);
-        let _guard = lock.read();
         let schema = self.catalog.get_table(&table_name)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let select_items = &select.projection;
@@ -362,8 +358,6 @@ impl<'a> Executor<'a> {
             .map(|twj| table_factor_name(&twj.relation))
             .ok_or_else(|| crate::error::MoodengError::Parse("missing FROM".into()))?;
 
-        let lock = self.locks.lock_for(&table_name);
-        let _guard = lock.read();
         let schema = self.catalog.get_table(&table_name)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let plan = plan_scan(
@@ -393,8 +387,6 @@ impl<'a> Executor<'a> {
         from: &TableWithJoins,
     ) -> crate::error::Result<QueryResult> {
         let left_table = table_factor_name(&from.relation);
-        let lock_l = self.locks.lock_for(&left_table);
-        let _gl = lock_l.read();
 
         let left_schema = self.catalog.get_table(&left_table)?;
         let left_cols: Vec<String> = left_schema
@@ -412,8 +404,6 @@ impl<'a> Executor<'a> {
 
         for join in &from.joins {
             let (right_table, on_expr) = parse_inner_join(join)?;
-            let lock_r = self.locks.lock_for(&right_table);
-            let _gr = lock_r.read();
 
             let right_schema = self.catalog.get_table(&right_table)?;
             let right_cols: Vec<String> = right_schema
@@ -512,8 +502,6 @@ impl<'a> Executor<'a> {
         assignments: &[Assignment],
         where_clause: Option<&Expr>,
     ) -> crate::error::Result<QueryResult> {
-        let lock = self.locks.lock_for(table);
-        let _guard = lock.write();
         let schema = self.catalog.get_table(table)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
@@ -527,6 +515,9 @@ impl<'a> Executor<'a> {
             };
 
             if should_update {
+                let row_lock = self.locks.row_lock_for(table, id);
+                let _guard = row_lock.write();
+
                 if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Update {
                         table: table.to_string(),
@@ -545,7 +536,9 @@ impl<'a> Executor<'a> {
 
                 Self::validate_row(&schema, &row.values)?;
 
-                self.storage.update(table, id, row.clone(), txn_id)?;
+                let expected_version = row.version;
+                self.storage
+                    .update(table, id, row.clone(), txn_id, expected_version)?;
                 self.indexes.insert_row(table, &row.values, &col_names, id)?;
                 count += 1;
             }
@@ -560,8 +553,6 @@ impl<'a> Executor<'a> {
         table: &str,
         where_clause: Option<&Expr>,
     ) -> crate::error::Result<QueryResult> {
-        let lock = self.locks.lock_for(table);
-        let _guard = lock.write();
         let schema = self.catalog.get_table(table)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
@@ -575,6 +566,9 @@ impl<'a> Executor<'a> {
             };
 
             if should_delete {
+                let row_lock = self.locks.row_lock_for(table, id);
+                let _guard = row_lock.write();
+
                 if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Delete {
                         table: table.to_string(),
@@ -600,7 +594,7 @@ impl<'a> Executor<'a> {
         columns: Vec<String>,
         unique: bool,
     ) -> crate::error::Result<QueryResult> {
-        let lock = self.locks.lock_for(table);
+        let lock = self.locks.ddl_lock_for(table);
         let _guard = lock.write();
         let schema = self.catalog.get_table(table)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();

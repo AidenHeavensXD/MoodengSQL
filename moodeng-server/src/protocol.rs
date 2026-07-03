@@ -4,14 +4,43 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::auth::AuthConfig;
 use crate::session::ConnectionSession;
 
-pub async fn handle_connection(mut stream: TcpStream, db: Arc<Database>) -> anyhow::Result<()> {
+pub async fn handle_connection(
+    mut stream: TcpStream,
+    db: Arc<Database>,
+    auth: Arc<AuthConfig>,
+) -> anyhow::Result<()> {
     let len = stream.read_i32().await? as usize;
     let mut buf = vec![0u8; len.saturating_sub(4)];
     stream.read_exact(&mut buf).await?;
     let mut cursor = &buf[..];
     let _version = cursor.get_i32();
+
+    if auth.required() {
+        send_message(&mut stream, b'R', |b| {
+            b.put_i32(8);
+            b.put_i32(3); // AuthenticationCleartextPassword
+        })
+        .await?;
+
+        let msg_type = stream.read_u8().await?;
+        if msg_type != b'p' {
+            send_error(&mut stream, "expected password message").await?;
+            return Ok(());
+        }
+        let pw_len = stream.read_i32().await? as usize;
+        let mut pw_buf = vec![0u8; pw_len.saturating_sub(4)];
+        if !pw_buf.is_empty() {
+            stream.read_exact(&mut pw_buf).await?;
+        }
+        let password = read_cstring(&pw_buf);
+        if !auth.verify(&password) {
+            send_error(&mut stream, "authentication failed").await?;
+            return Ok(());
+        }
+    }
 
     send_message(&mut stream, b'R', |b| {
         b.put_i32(8);

@@ -20,6 +20,9 @@ pub enum MoodengError {
     #[error("duplicate key: {0}")]
     DuplicateKey(String),
 
+    #[error("row version conflict on {table} id {row_id}")]
+    VersionConflict { table: String, row_id: u64 },
+
     #[error("index '{0}' already exists")]
     IndexExists(String),
 

@@ -22,6 +22,9 @@ tracing.workspace = true
 tar.workspace = true
 flate2.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"

@@ -168,11 +168,21 @@ pub struct ColumnDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub values: Vec<Value>,
+    /// Optimistic concurrency version — incremented on every successful UPDATE.
+    #[serde(default = "default_row_version")]
+    pub version: u64,
+}
+
+fn default_row_version() -> u64 {
+    1
 }
 
 impl Row {
     pub fn new(values: Vec<Value>) -> Self {
-        Self { values }
+        Self {
+            values,
+            version: 1,
+        }
     }
 }
 

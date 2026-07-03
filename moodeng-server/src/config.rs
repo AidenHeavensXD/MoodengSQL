@@ -9,6 +9,15 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub auth: AuthConfigSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthConfigSection {
+    /// Argon2 password hash (`moodengsql hash-password`). When empty, uses `MOODENG_PASSWORD` env.
+    #[serde(default)]
+    pub password_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +48,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             log: LogConfig::default(),
+            auth: AuthConfigSection::default(),
         }
     }
 }

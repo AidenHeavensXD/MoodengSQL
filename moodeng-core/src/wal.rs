@@ -326,6 +326,73 @@ impl WriteAheadLog {
     pub fn current_lsn(&self) -> u64 {
         *self.lsn.lock()
     }
+
+    pub fn path(&self) -> &Path {
+        &self.wal_path
+    }
+}
+
+/// Encode a single WAL record (lsn + body with CRC32 + payload).
+pub fn encode_wal_entry(lsn: u64, op: &WalOp) -> Vec<u8> {
+    let payload = bincode::serialize(op).expect("WalOp serializable");
+    let checksum = crc32(&payload);
+    let body_len = 4 + payload.len();
+    let mut buf = Vec::with_capacity(12 + body_len);
+    buf.extend_from_slice(&lsn.to_be_bytes());
+    buf.extend_from_slice(&(body_len as u32).to_be_bytes());
+    buf.extend_from_slice(&checksum.to_be_bytes());
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Replay WAL bytes, stopping at torn entries or checksum failures (never panics).
+pub fn replay_from_bytes(data: &[u8], from_lsn: u64) -> Vec<(u64, WalOp)> {
+    let mut cursor = std::io::Cursor::new(data);
+    let mut entries = Vec::new();
+
+    loop {
+        let mut lsn_buf = [0u8; 8];
+        if cursor.read_exact(&mut lsn_buf).is_err() {
+            break;
+        }
+        let lsn = u64::from_be_bytes(lsn_buf);
+
+        let mut len_buf = [0u8; 4];
+        if cursor.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let body_len = u32::from_be_bytes(len_buf) as usize;
+        if body_len < 4 {
+            break;
+        }
+
+        let mut crc_buf = [0u8; 4];
+        if cursor.read_exact(&mut crc_buf).is_err() {
+            break;
+        }
+        let stored_crc = u32::from_be_bytes(crc_buf);
+
+        let payload_len = body_len - 4;
+        let mut payload = vec![0u8; payload_len];
+        if cursor.read_exact(&mut payload).is_err() {
+            break;
+        }
+
+        if crc32(&payload) != stored_crc {
+            break;
+        }
+
+        let op: WalOp = match bincode::deserialize(&payload) {
+            Ok(op) => op,
+            Err(_) => break,
+        };
+
+        if lsn > from_lsn {
+            entries.push((lsn, op));
+        }
+    }
+
+    entries
 }
 
 #[cfg(test)]
