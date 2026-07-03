@@ -1,5 +1,6 @@
 use sqlparser::ast::{
-    Assignment, Expr, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor,
+    Assignment, Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, ObjectName, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 
 use crate::catalog::{Catalog, IndexMeta};
@@ -11,6 +12,7 @@ use crate::parser::{
     values_from_insert,
 };
 use crate::planner::{plan_scan, ScanPlan};
+use crate::query_util::{apply_group_by, apply_limit_offset, sort_rows};
 use crate::storage::StorageEngine;
 use crate::transaction::{apply_undo, Session, UndoRecord};
 use crate::types::{ColumnDef, QueryResult, Row, Value};
@@ -253,16 +255,28 @@ impl<'a> Executor<'a> {
     }
 
     fn select(&self, query: &Query) -> crate::error::Result<QueryResult> {
-        let (table_name, where_clause) = extract_select_info(query)?;
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(crate::error::MoodengError::Parse("unsupported SELECT".into()));
+        };
+
+        if let Some(from) = select.from.first() {
+            if !from.joins.is_empty() {
+                return self.select_join(query, select, from);
+            }
+        }
+
+        let table_name = select
+            .from
+            .first()
+            .map(|twj| table_factor_name(&twj.relation))
+            .ok_or_else(|| crate::error::MoodengError::Parse("missing FROM".into()))?;
+        let where_clause = select.selection.clone();
+
         let lock = self.locks.lock_for(&table_name);
         let _guard = lock.read();
         let schema = self.catalog.get_table(&table_name)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-
-        let select_items = match query.body.as_ref() {
-            SetExpr::Select(s) => &s.projection,
-            _ => return Err(crate::error::MoodengError::Parse("unsupported SELECT".into())),
-        };
+        let select_items = &select.projection;
 
         let wildcard = select_items.iter().any(|i| matches!(i, SelectItem::Wildcard(_)));
         let output_cols = if wildcard {
@@ -291,22 +305,128 @@ impl<'a> Executor<'a> {
                     continue;
                 }
             }
-
-            let projected = if wildcard {
-                row.values.clone()
-            } else {
-                select_items
-                    .iter()
-                    .map(|item| match item {
-                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                            eval_expr(expr, &row.values, &col_names)
-                        }
-                        _ => Ok(Value::Null),
-                    })
-                    .collect::<crate::error::Result<Vec<_>>>()?
-            };
-            result_rows.push(Row::new(projected));
+            result_rows.push(row);
         }
+
+        self.finalize_select(query, select, output_cols, result_rows, &col_names)
+    }
+
+    fn select_join(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        from: &TableWithJoins,
+    ) -> crate::error::Result<QueryResult> {
+        let left_table = table_factor_name(&from.relation);
+        let lock_l = self.locks.lock_for(&left_table);
+        let _gl = lock_l.read();
+
+        let left_schema = self.catalog.get_table(&left_table)?;
+        let left_cols: Vec<String> = left_schema
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", left_table, c.name))
+            .collect();
+        let left_rows = self.storage.scan(&left_table)?;
+
+        let mut combined_cols = left_cols.clone();
+        let mut joined_rows: Vec<Row> = left_rows
+            .into_iter()
+            .map(|(_, row)| Row::new(row.values))
+            .collect();
+
+        for join in &from.joins {
+            let (right_table, on_expr) = parse_inner_join(join)?;
+            let lock_r = self.locks.lock_for(&right_table);
+            let _gr = lock_r.read();
+
+            let right_schema = self.catalog.get_table(&right_table)?;
+            let right_cols: Vec<String> = right_schema
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", right_table, c.name))
+                .collect();
+            let right_rows = self.storage.scan(&right_table)?;
+
+            combined_cols.extend(right_cols.clone());
+
+            let mut next = Vec::new();
+            for lrow in &joined_rows {
+                for (_, rrow) in &right_rows {
+                    let mut values = lrow.values.clone();
+                    values.extend(rrow.values.clone());
+                    if eval_where(&on_expr, &values, &combined_cols)? {
+                        next.push(Row::new(values));
+                    }
+                }
+            }
+            joined_rows = next;
+        }
+
+        let select_items = &select.projection;
+        let wildcard = select_items.iter().any(|i| matches!(i, SelectItem::Wildcard(_)));
+        let output_cols = if wildcard {
+            combined_cols.clone()
+        } else {
+            select_items_to_columns(select_items)
+        };
+
+        let where_clause = select.selection.clone();
+        let mut result_rows = Vec::new();
+
+        for row in joined_rows {
+            if let Some(w) = &where_clause {
+                if !eval_where(w, &row.values, &combined_cols)? {
+                    continue;
+                }
+            }
+            result_rows.push(row);
+        }
+
+        self.finalize_select(query, select, output_cols, result_rows, &combined_cols)
+    }
+
+    fn finalize_select(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        mut output_cols: Vec<String>,
+        mut result_rows: Vec<Row>,
+        col_names: &[String],
+    ) -> crate::error::Result<QueryResult> {
+        if group_by_exprs(&select.group_by).is_empty()
+            && !crate::query_util::is_aggregate_query(&select.projection)
+        {
+            // no grouping
+        } else {
+            let (gb_cols, gb_rows) = apply_group_by(
+                &select.projection,
+                &group_by_exprs(&select.group_by),
+                result_rows,
+                col_names,
+            )?;
+            if !gb_cols.is_empty() {
+                output_cols = gb_cols;
+            }
+            result_rows = gb_rows;
+        }
+
+        if let Some(order_by) = &query.order_by {
+            sort_rows(&mut result_rows, &order_by.exprs, col_names)?;
+        }
+
+        result_rows = apply_limit_offset(
+            result_rows,
+            query.limit.as_ref(),
+            query.offset.as_ref().map(|o| &o.value),
+            col_names,
+        )?;
+
+        let wildcard = select
+            .projection
+            .iter()
+            .any(|i| matches!(i, SelectItem::Wildcard(_)));
+        result_rows = project_rows(&select.projection, result_rows, col_names, wildcard)?;
 
         Ok(QueryResult::select(output_cols, result_rows))
     }
@@ -439,6 +559,56 @@ impl<'a> Executor<'a> {
         )?;
 
         Ok(QueryResult::ddl(format!("CREATE INDEX {index_name}")))
+    }
+}
+
+
+
+fn project_rows(
+    select_items: &[SelectItem],
+    rows: Vec<Row>,
+    col_names: &[String],
+    wildcard: bool,
+) -> crate::error::Result<Vec<Row>> {
+    rows.into_iter()
+        .map(|row| {
+            let projected = if wildcard {
+                row.values
+            } else {
+                select_items
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                            eval_expr(expr, &row.values, col_names)
+                        }
+                        _ => Ok(Value::Null),
+                    })
+                    .collect::<crate::error::Result<Vec<_>>>()?
+            };
+            Ok(Row::new(projected))
+        })
+        .collect()
+}
+
+fn group_by_exprs(group_by: &GroupByExpr) -> Vec<Expr> {
+    match group_by {
+        GroupByExpr::All(_) => vec![],
+        GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+    }
+}
+
+fn parse_inner_join(join: &Join) -> crate::error::Result<(String, Expr)> {
+    let table = table_factor_name(&join.relation);
+    match &join.join_operator {
+        JoinOperator::Inner(JoinConstraint::On(expr)) => Ok((table, expr.clone())),
+        JoinOperator::Inner(JoinConstraint::None) | JoinOperator::CrossJoin => {
+            Err(crate::error::MoodengError::Parse(
+                "JOIN requires ON clause".into(),
+            ))
+        }
+        _ => Err(crate::error::MoodengError::Parse(
+            "only INNER JOIN supported".into(),
+        )),
     }
 }
 

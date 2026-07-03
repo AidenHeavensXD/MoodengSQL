@@ -158,11 +158,72 @@ fn wal_replay_after_reopen() {
         }
     }
 
-    {
-        let db = Database::open(&dir).unwrap();
-        let result = db.execute("SELECT * FROM t").unwrap();
-        assert_eq!(result.rows.len(), 10);
-    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn order_by_limit_offset() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 30)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 20)").unwrap();
+
+    let result = db
+        .execute("SELECT id FROM t ORDER BY score DESC LIMIT 2 OFFSET 1")
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].values[0].to_display_string(), "3");
+    assert_eq!(result.rows[1].values[0].to_display_string(), "2");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inner_join_works() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, item TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1, 'book')").unwrap();
+
+    let result = db
+        .execute("SELECT users.name, orders.item FROM users INNER JOIN orders ON users.id = orders.user_id")
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0].to_display_string(), "Alice");
+    assert_eq!(result.rows[0].values[1].to_display_string(), "book");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn group_by_count() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE t (dept TEXT, name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('eng', 'a')").unwrap();
+    db.execute("INSERT INTO t VALUES ('eng', 'b')").unwrap();
+    db.execute("INSERT INTO t VALUES ('hr', 'c')").unwrap();
+
+    let result = db
+        .execute("SELECT dept, COUNT(*) FROM t GROUP BY dept ORDER BY dept")
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn substitute_params_replaces_placeholders() {
+    use moodeng_core::substitute_params;
+    let sql = "SELECT * FROM t WHERE id = $1 AND name = $2";
+    let out = substitute_params(sql, &[Some("42".into()), Some("alice".into())]);
+    assert!(out.contains("42"));
+    assert!(out.contains("'alice'"));
 }

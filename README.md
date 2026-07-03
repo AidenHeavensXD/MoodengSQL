@@ -14,6 +14,10 @@ MoodengSQL is a blazing-fast, PostgreSQL-inspired relational database engine wri
 - **WAL + checkpoint** — write-ahead log with automatic checkpointing (every 50 ops)
 - **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` with undo log
 - **Index scan** — `SELECT ... WHERE col = value` uses B-tree index when available
+- **ORDER BY / LIMIT / OFFSET** — sorted and paginated queries
+- **INNER JOIN** — multi-table queries with `ON` clause
+- **GROUP BY** — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` aggregates
+- **Extended protocol** — Parse/Bind/Execute for parameterized queries (`$1`, `$2`)
 - **Table-level locking** — concurrent connections with read/write locks
 - **Constraints** — PRIMARY KEY (auto-index) and NOT NULL enforcement
 - **Data validation** — `moodengsql --check` verifies catalog/storage consistency

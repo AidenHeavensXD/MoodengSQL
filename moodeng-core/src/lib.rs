@@ -13,6 +13,7 @@ pub mod lock;
 pub mod meta;
 pub mod parser;
 pub mod planner;
+pub mod query_util;
 pub mod recovery;
 pub mod storage;
 pub mod transaction;
@@ -22,6 +23,7 @@ pub mod wal;
 pub use engine::Database;
 pub use error::{MoodengError, Result};
 pub use transaction::Session;
+pub use query_util::substitute_params;
 pub use types::{ColumnDef, DataType, QueryResult, Row, Value};
 
 pub const ENGINE_NAME: &str = "MoodengSQL";

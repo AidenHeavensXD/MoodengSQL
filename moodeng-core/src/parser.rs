@@ -89,8 +89,16 @@ pub fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> crate::error
         Expr::Value(v) => Ok(Value::from_sql_literal(v)),
         Expr::Identifier(Ident { value, .. }) => column_value(value, row, columns),
         Expr::CompoundIdentifier(parts) => {
-            let col = parts.last().map(|i| i.value.as_str()).unwrap_or("");
-            column_value(col, row, columns)
+            let col = if parts.len() >= 2 {
+                format!(
+                    "{}.{}",
+                    parts[parts.len() - 2].value,
+                    parts[parts.len() - 1].value
+                )
+            } else {
+                parts.last().map(|i| i.value.clone()).unwrap_or_default()
+            };
+            column_value(&col, row, columns)
         }
         Expr::BinaryOp { left, op, right } => {
             let l = eval_expr(left, row, columns)?;
