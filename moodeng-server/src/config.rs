@@ -18,6 +18,9 @@ pub struct AuthConfigSection {
     /// Argon2 password hash (`moodengsql hash-password`). When empty, uses `MOODENG_PASSWORD` env.
     #[serde(default)]
     pub password_hash: Option<String>,
+    /// SCRAM-SHA-256 secret (`moodengsql hash-password --scram`).
+    #[serde(default)]
+    pub password_scram: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

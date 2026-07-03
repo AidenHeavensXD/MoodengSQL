@@ -10,6 +10,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::AuthConfig;
+use crate::scram::{ScramSession, SCRAM_SHA256};
 use crate::session::ConnectionSession;
 use crate::tls::TlsSettings;
 
@@ -184,30 +185,14 @@ async fn run_session(
     let mut cursor = &buf[..];
     let _version = cursor.get_i32();
 
-    if auth.required() && !encrypted && auth.require_tls_for_password {
+    if auth.required() && !encrypted && auth.require_tls_for_password && !auth.scram_available() {
         send_error(&mut stream, "password authentication requires TLS").await?;
         return Ok(());
     }
 
     if auth.required() {
-        send_message(&mut stream, b'R', |b| {
-            b.put_i32(3); // AuthenticationCleartextPassword
-        })
-        .await?;
-
-        let msg_type = stream.read_u8().await?;
-        if msg_type != b'p' {
-            send_error(&mut stream, "expected password message").await?;
-            return Ok(());
-        }
-        let pw_len = stream.read_i32().await? as usize;
-        let mut pw_buf = vec![0u8; pw_len.saturating_sub(4)];
-        if !pw_buf.is_empty() {
-            stream.read_exact(&mut pw_buf).await?;
-        }
-        let password = read_cstring(&pw_buf);
-        if !auth.verify(&password) {
-            send_error(&mut stream, "authentication failed").await?;
+        let ok = authenticate(&mut stream, &auth).await?;
+        if !ok {
             return Ok(());
         }
     }
@@ -270,6 +255,125 @@ async fn run_session(
     }
 
     Ok(())
+}
+
+async fn authenticate<S>(stream: &mut S, auth: &AuthConfig) -> anyhow::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if auth.scram_available() {
+        return authenticate_scram(stream, auth).await;
+    }
+    authenticate_cleartext(stream, auth).await
+}
+
+async fn authenticate_cleartext<S>(stream: &mut S, auth: &AuthConfig) -> anyhow::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_message(stream, b'R', |b| {
+        b.put_i32(3);
+    })
+    .await?;
+
+    let msg_type = stream.read_u8().await?;
+    if msg_type != b'p' {
+        send_error(stream, "expected password message").await?;
+        return Ok(false);
+    }
+    let pw_len = stream.read_i32().await? as usize;
+    let mut pw_buf = vec![0u8; pw_len.saturating_sub(4)];
+    if !pw_buf.is_empty() {
+        stream.read_exact(&mut pw_buf).await?;
+    }
+    let password = read_cstring(&pw_buf);
+    if !auth.verify(&password) {
+        send_error(stream, "authentication failed").await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn authenticate_scram<S>(stream: &mut S, auth: &AuthConfig) -> anyhow::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_message(stream, b'R', |b| {
+        b.put_i32(10);
+        b.put_slice(format!("{SCRAM_SHA256}\0\0").as_bytes());
+    })
+    .await?;
+
+    let (mechanism, client_first) = read_sasl_message(stream).await?;
+    if !mechanism.is_empty() && mechanism != SCRAM_SHA256 {
+        send_error(stream, "unsupported SASL mechanism").await?;
+        return Ok(false);
+    }
+    let client_first = String::from_utf8(client_first)
+        .map_err(|e| anyhow::anyhow!("invalid SCRAM client-first encoding: {e}"))?;
+
+    let creds = auth
+        .scram_credentials
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("SCRAM credentials not configured"))?;
+    let (session, server_first) = ScramSession::start(creds, &client_first)?;
+
+    send_message(stream, b'R', |b| {
+        b.put_i32(11);
+        b.put_slice(server_first.as_bytes());
+        b.put_u8(0);
+    })
+    .await?;
+
+    let (_, client_final_bytes) = read_sasl_message(stream).await?;
+    let client_final = String::from_utf8(client_final_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid SCRAM client-final encoding: {e}"))?;
+
+    match session.finish(&client_final) {
+        Ok(server_final) => {
+            send_message(stream, b'R', |b| {
+                b.put_i32(12);
+                b.put_slice(server_final.as_bytes());
+                b.put_u8(0);
+            })
+            .await?;
+            Ok(true)
+        }
+        Err(e) => {
+            send_error(stream, &format!("authentication failed: {e}")).await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn read_sasl_message<S>(stream: &mut S) -> anyhow::Result<(String, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let msg_type = stream.read_u8().await?;
+    if msg_type != b'p' {
+        anyhow::bail!("expected SASL password message, got {msg_type}");
+    }
+    let msg_len = stream.read_i32().await? as usize;
+    let mut payload = vec![0u8; msg_len.saturating_sub(4)];
+    if !payload.is_empty() {
+        stream.read_exact(&mut payload).await?;
+    }
+    let mut cur = &payload[..];
+    let mechanism = read_cstring_buf(&mut cur);
+    if cur.remaining() < 4 {
+        anyhow::bail!("truncated SASL payload");
+    }
+    let data_len = cur.get_i32();
+    if data_len < 0 {
+        return Ok((mechanism, Vec::new()));
+    }
+    let data_len = data_len as usize;
+    if cur.remaining() < data_len {
+        anyhow::bail!("truncated SASL response data");
+    }
+    let data = cur[..data_len].to_vec();
+    Ok((mechanism, data))
 }
 
 async fn run_sql<S>(
@@ -611,6 +715,7 @@ mod tests {
 
         let auth = Arc::new(AuthConfig {
             password_hash: Some(hash_password("secret")),
+            scram_credentials: None,
             require_tls_for_password: true,
         });
         let addr = spawn_test_server(auth, test.settings.clone(), Some(acceptor)).await;
@@ -653,5 +758,138 @@ mod tests {
         assert_eq!(tls_stream.read_i32().await.unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scram_sha256_handshake_succeeds() {
+        use crate::scram::ScramCredentials;
+
+        let auth = Arc::new(AuthConfig {
+            password_hash: None,
+            scram_credentials: Some(ScramCredentials::from_password("secret")),
+            require_tls_for_password: false,
+        });
+        let addr = spawn_test_server(auth, TlsSettings::default(), None).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&startup_packet()).await.unwrap();
+
+        assert_eq!(stream.read_u8().await.unwrap(), b'R');
+        let init_len = stream.read_i32().await.unwrap() as usize;
+        let mut init_body = vec![0u8; init_len.saturating_sub(4)];
+        stream.read_exact(&mut init_body).await.unwrap();
+        assert_eq!(i32::from_be_bytes(init_body[..4].try_into().unwrap()), 10);
+
+        let client_first = b"n,,n=moodeng,r=clientnonce123";
+        let mut sasl = Vec::new();
+        sasl.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+        sasl.extend_from_slice(client_first);
+        stream.write_u8(b'p').await.unwrap();
+        stream.write_i32((sasl.len() + 4) as i32).await.unwrap();
+        stream.write_all(&sasl).await.unwrap();
+
+        assert_eq!(stream.read_u8().await.unwrap(), b'R');
+        let msg_len = stream.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; msg_len.saturating_sub(4)];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(i32::from_be_bytes(body[..4].try_into().unwrap()), 11);
+        let server_first = String::from_utf8_lossy(&body[4..])
+            .trim_end_matches('\0')
+            .to_string();
+
+        let client_final = build_scram_client_final("secret", client_first, &server_first);
+        let mut sasl2 = Vec::new();
+        sasl2.push(0);
+        sasl2.extend_from_slice(&(client_final.len() as i32).to_be_bytes());
+        sasl2.extend_from_slice(client_final.as_bytes());
+        stream.write_u8(b'p').await.unwrap();
+        stream.write_i32((sasl2.len() + 4) as i32).await.unwrap();
+        stream.write_all(&sasl2).await.unwrap();
+
+        assert_eq!(stream.read_u8().await.unwrap(), b'R');
+        let fin_len = stream.read_i32().await.unwrap() as usize;
+        let mut fin_body = vec![0u8; fin_len.saturating_sub(4)];
+        stream.read_exact(&mut fin_body).await.unwrap();
+        assert_eq!(i32::from_be_bytes(fin_body[..4].try_into().unwrap()), 12);
+
+        assert_eq!(stream.read_u8().await.unwrap(), b'R');
+        assert_eq!(stream.read_i32().await.unwrap(), 8);
+        assert_eq!(stream.read_i32().await.unwrap(), 0);
+    }
+
+    fn build_scram_client_final(password: &str, client_first: &[u8], server_first: &str) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let client_first_str = std::str::from_utf8(client_first).unwrap();
+        let bare = client_first_str
+            .strip_prefix("n,,")
+            .expect("client-first gs2 header");
+        let mut server_attrs = std::collections::HashMap::new();
+        for part in server_first.split(',') {
+            let (k, v) = part.split_once('=').unwrap();
+            server_attrs.insert(k.to_string(), v.to_string());
+        }
+        let salt = STANDARD.decode(server_attrs["s"].as_str()).unwrap();
+        let iterations: u32 = server_attrs["i"].parse().unwrap();
+        let combined_nonce = server_attrs["r"].clone();
+
+        fn hi(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            type HmacSha256 = Hmac<Sha256>;
+            let mut ui = {
+                let mut mac = HmacSha256::new_from_slice(salt).unwrap();
+                mac.update(password.as_bytes());
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&mac.finalize().into_bytes());
+                out
+            };
+            let mut result = ui;
+            for _ in 1..iterations {
+                let mut mac = HmacSha256::new_from_slice(&ui).unwrap();
+                mac.update(password.as_bytes());
+                ui = {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&mac.finalize().into_bytes());
+                    out
+                };
+                for (acc, val) in result.iter_mut().zip(ui.iter()) {
+                    *acc ^= val;
+                }
+            }
+            result
+        }
+
+        fn hmac_sha256(key: &[u8], data: &str) -> [u8; 32] {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            mac.update(data.as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&mac.finalize().into_bytes());
+            out
+        }
+
+        fn sha256(data: &[u8]) -> [u8; 32] {
+            use sha2::{Digest, Sha256};
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&Sha256::digest(data));
+            out
+        }
+
+        let salted_password = hi(password, &salt, iterations);
+        let client_key = hmac_sha256(&salted_password, "Client Key");
+        let stored_key = sha256(&client_key);
+        let without_proof = format!("c=biws,r={combined_nonce}");
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let client_signature = hmac_sha256(&stored_key, &auth_message);
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        format!("{without_proof},p={}", STANDARD.encode(proof))
     }
 }

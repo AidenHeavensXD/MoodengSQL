@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod protocol;
+mod scram;
 mod session;
 mod tls;
 
@@ -14,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use auth::{hash_password, AuthConfig};
+use auth::{hash_password, hash_scram, AuthConfig};
 use config::Config;
 use tls::TlsSettings;
 
@@ -49,6 +50,9 @@ enum Command {
     HashPassword {
         /// Plain-text password to hash
         password: String,
+        /// Emit SCRAM-SHA-256 secret for [auth].password_scram
+        #[arg(long)]
+        scram: bool,
     },
 }
 
@@ -114,8 +118,11 @@ fn data_dir(cfg: &Config, override_dir: Option<PathBuf>) -> PathBuf {
 }
 
 fn auth_config(cfg: &Config, tls: &TlsSettings) -> AuthConfig {
-    let mut auth = AuthConfig::from_config_and_env(cfg.auth.password_hash.clone());
-    if auth.required() && tls.tls_available() {
+    let mut auth = AuthConfig::from_config_and_env(
+        cfg.auth.password_hash.clone(),
+        cfg.auth.password_scram.clone(),
+    );
+    if auth.password_hash.is_some() && tls.tls_available() && !auth.scram_available() {
         auth.require_tls_for_password = true;
     }
     auth
@@ -148,8 +155,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Backup(args)) => run_backup(&cfg, &args),
         Some(Command::Restore(args)) => run_restore(&cfg, &args),
         Some(Command::Ping(args)) => run_ping(&cfg, &args).await,
-        Some(Command::HashPassword { password }) => {
-            println!("{}", hash_password(&password));
+        Some(Command::HashPassword { password, scram }) => {
+            if scram {
+                println!("{}", hash_scram(&password));
+            } else {
+                println!("{}", hash_password(&password));
+            }
             Ok(())
         }
     }

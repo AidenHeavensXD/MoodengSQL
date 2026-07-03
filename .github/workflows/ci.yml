@@ -18,5 +18,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace
+      - name: Benchmark regression smoke
+        run: |
+          MOODENG_BENCH_MIN_INSERT=500 MOODENG_BENCH_MIN_SELECT=500 \
+            cargo run --release --example benchmark -p moodeng-core
       - name: Build release
         run: cargo build --release --workspace

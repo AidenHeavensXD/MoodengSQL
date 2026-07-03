@@ -21,3 +21,5 @@ level = "info"
 # Generate with: moodengsql hash-password "your-password"
 # Or set MOODENG_PASSWORD env at runtime (hashed on startup).
 password_hash = ""
+# SCRAM-SHA-256 for libpq / psql clients (moodengsql hash-password --scram)
+password_scram = ""

@@ -2,27 +2,42 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use rand::rngs::OsRng;
 
+use crate::scram::{generate_scram_secret, ScramCredentials};
+
 /// Resolved authentication settings for the server.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-    /// Argon2 password hash. When `None`, connections are accepted without auth (trust mode).
+    /// Argon2 password hash for cleartext-password fallback (auth type 3).
     pub password_hash: Option<String>,
+    /// SCRAM-SHA-256 credentials for SASL authentication (auth type 10).
+    pub scram_credentials: Option<ScramCredentials>,
     /// When true, cleartext password messages are rejected unless the connection uses TLS.
     pub require_tls_for_password: bool,
 }
 
 impl AuthConfig {
-    pub fn from_config_and_env(hash_from_file: Option<String>) -> Self {
-        if let Some(hash) = hash_from_file.filter(|h| !h.is_empty()) {
+    pub fn from_config_and_env(
+        hash_from_file: Option<String>,
+        scram_from_file: Option<String>,
+    ) -> Self {
+        let password_hash = hash_from_file.filter(|h| !h.is_empty());
+        let scram_credentials = scram_from_file
+            .filter(|s| !s.is_empty())
+            .and_then(|s| ScramCredentials::parse(&s).ok());
+
+        if password_hash.is_some() || scram_credentials.is_some() {
             return Self {
-                password_hash: Some(hash),
+                password_hash,
+                scram_credentials,
                 require_tls_for_password: false,
             };
         }
+
         if let Ok(password) = std::env::var("MOODENG_PASSWORD") {
             if !password.is_empty() {
                 return Self {
                     password_hash: Some(hash_password(&password)),
+                    scram_credentials: Some(ScramCredentials::from_password(&password)),
                     require_tls_for_password: false,
                 };
             }
@@ -31,7 +46,11 @@ impl AuthConfig {
     }
 
     pub fn required(&self) -> bool {
-        self.password_hash.is_some()
+        self.password_hash.is_some() || self.scram_credentials.is_some()
+    }
+
+    pub fn scram_available(&self) -> bool {
+        self.scram_credentials.is_some()
     }
 
     pub fn verify(&self, password: &str) -> bool {
@@ -60,6 +79,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+pub fn hash_scram(password: &str) -> String {
+    generate_scram_secret(password)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +94,15 @@ mod tests {
         assert!(!verify_password("wrong", &hash));
     }
 
+    #[test]
+    fn env_password_generates_scram_and_argon2() {
+        std::env::set_var("MOODENG_PASSWORD", "env-secret");
+        let auth = AuthConfig::from_config_and_env(None, None);
+        std::env::remove_var("MOODENG_PASSWORD");
+        assert!(auth.scram_available());
+        assert!(auth.password_hash.is_some());
+    }
+
     #[tokio::test]
     async fn cleartext_password_handshake() {
         use std::sync::Arc;
@@ -79,6 +111,7 @@ mod tests {
 
         let auth = Arc::new(AuthConfig {
             password_hash: Some(hash_password("secret")),
+            scram_credentials: None,
             require_tls_for_password: false,
         });
 
