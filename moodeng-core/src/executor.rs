@@ -1,6 +1,7 @@
 use sqlparser::ast::{
-    Assignment, Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Assignment, ConflictTarget, DoUpdate, Expr, GroupByExpr, Insert, Join, JoinConstraint,
+    JoinOperator, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins,
 };
 
 use parking_lot::RwLock;
@@ -11,9 +12,9 @@ use crate::catalog::{Catalog, IndexMeta};
 use crate::index::{BTreeIndex, IndexManager};
 use crate::lock::LockManager;
 use crate::parser::{
-    assignment_value, eval_expr, eval_where, extract_ident, extract_pk_from_constraints,
-    extract_table_name, parse_sql, select_items_to_columns, sql_column_to_def,
-    values_from_insert,
+    assignment_value, assignment_value_with_excluded, eval_expr, eval_where,
+    eval_where_with_excluded, extract_ident, extract_pk_from_constraints, extract_table_name,
+    parse_sql, select_items_to_columns, sql_column_to_def, values_from_insert,
 };
 use crate::planner::{plan_scan, ScanPlan};
 use crate::query_util::{apply_group_by, apply_limit_offset, sort_rows};
@@ -82,11 +83,10 @@ impl<'a> Executor<'a> {
                 }
             }
             Statement::Insert(insert) => {
-                let table = extract_table_name(&insert.table_name);
                 let source = insert.source.as_ref().ok_or_else(|| {
                     crate::error::MoodengError::Parse("missing INSERT source".into())
                 })?;
-                self.insert(&table, source)
+                self.insert(insert, source)
             }
             Statement::Query(query) => self.select(query),
             Statement::Update { table, assignments, selection, .. } => {
@@ -266,10 +266,25 @@ impl<'a> Executor<'a> {
         Ok(QueryResult::ddl(format!("DROP TABLE {table}")))
     }
 
-    fn insert(&mut self, table: &str, source: &Query) -> crate::error::Result<QueryResult> {
-        let schema = self.catalog.get_table(table)?;
+    fn insert(&mut self, insert: &Insert, source: &Query) -> crate::error::Result<QueryResult> {
+        let table = extract_table_name(&insert.table_name);
+        let schema = self.catalog.get_table(&table)?;
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let rows = values_from_insert(source)?;
+        let on_conflict = match &insert.on {
+            Some(OnInsert::OnConflict(c)) => Some(c),
+            Some(OnInsert::DuplicateKeyUpdate(_)) => {
+                return Err(crate::error::MoodengError::Execution(
+                    "ON DUPLICATE KEY UPDATE is not supported; use ON CONFLICT".into(),
+                ));
+            }
+            Some(_) => {
+                return Err(crate::error::MoodengError::Execution(
+                    "unsupported INSERT conflict clause".into(),
+                ));
+            }
+            None => None,
+        };
         let mut count = 0u64;
         let backup_lock = self.backup_lock;
         let _backup = backup_lock.read();
@@ -284,15 +299,38 @@ impl<'a> Executor<'a> {
 
             Self::validate_row(&schema, &row_values)?;
 
+            if let Some(conflict) = on_conflict {
+                if let Some(existing_id) =
+                    self.find_conflict_row(&schema, &table, conflict, &col_names, &row_values)?
+                {
+                    match &conflict.action {
+                        OnConflictAction::DoNothing => continue,
+                        OnConflictAction::DoUpdate(du) => {
+                            self.apply_conflict_update(
+                                &table,
+                                &schema,
+                                &col_names,
+                                existing_id,
+                                &row_values,
+                                du,
+                                txn_id,
+                            )?;
+                            count += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let row_id = self
                 .storage
-                .insert(table, Row::new(row_values.clone()), txn_id)?;
+                .insert(&table, Row::new(row_values.clone()), txn_id)?;
             self.indexes
-                .insert_row(table, &row_values, &col_names, row_id)?;
+                .insert_row(&table, &row_values, &col_names, row_id)?;
 
             if self.session.transaction.is_active() && !self.session.auto_commit {
                 self.session.transaction.record(UndoRecord::Insert {
-                    table: table.to_string(),
+                    table: table.clone(),
                     row_id,
                 });
             }
@@ -301,6 +339,142 @@ impl<'a> Executor<'a> {
 
         self.finish_auto_commit_if_needed()?;
         Ok(QueryResult::modified(count, format!("INSERT 0 {count}")))
+    }
+
+    fn resolve_conflict_columns(
+        schema: &crate::catalog::TableSchema,
+        conflict: &OnConflict,
+    ) -> crate::error::Result<Vec<String>> {
+        match &conflict.conflict_target {
+            None => {
+                let pk: Vec<String> = schema
+                    .columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect();
+                if pk.is_empty() {
+                    return Err(crate::error::MoodengError::Execution(
+                        "ON CONFLICT requires a PRIMARY KEY or explicit conflict target".into(),
+                    ));
+                }
+                Ok(pk)
+            }
+            Some(ConflictTarget::Columns(idents)) => {
+                Ok(idents.iter().map(|i| i.value.clone()).collect())
+            }
+            Some(ConflictTarget::OnConstraint(_)) => Err(crate::error::MoodengError::Execution(
+                "ON CONFLICT ON CONSTRAINT is not supported".into(),
+            )),
+        }
+    }
+
+    fn find_unique_index_for_columns(
+        schema: &crate::catalog::TableSchema,
+        cols: &[String],
+    ) -> Option<String> {
+        schema.indexes.iter().find_map(|idx| {
+            if !idx.unique || idx.columns.len() != cols.len() {
+                return None;
+            }
+            let matches = idx
+                .columns
+                .iter()
+                .zip(cols.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b));
+            if matches {
+                Some(idx.name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn find_conflict_row(
+        &self,
+        schema: &crate::catalog::TableSchema,
+        table: &str,
+        conflict: &OnConflict,
+        col_names: &[String],
+        row_values: &[Value],
+    ) -> crate::error::Result<Option<crate::storage::RowId>> {
+        let conflict_cols = Self::resolve_conflict_columns(schema, conflict)?;
+        let index_name = Self::find_unique_index_for_columns(schema, &conflict_cols).ok_or_else(
+            || {
+                crate::error::MoodengError::Execution(format!(
+                    "there is no unique index matching ON CONFLICT specification on '{}'",
+                    conflict_cols.join(", ")
+                ))
+            },
+        )?;
+
+        let key_vals: Vec<Value> = conflict_cols
+            .iter()
+            .map(|col| {
+                let idx = col_names
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(col))
+                    .unwrap_or(0);
+                row_values.get(idx).cloned().unwrap_or(Value::Null)
+            })
+            .collect();
+
+        let ids = self.indexes.lookup(table, &index_name, &key_vals);
+        Ok(ids.first().copied())
+    }
+
+    fn apply_conflict_update(
+        &mut self,
+        table: &str,
+        schema: &crate::catalog::TableSchema,
+        col_names: &[String],
+        row_id: crate::storage::RowId,
+        proposed: &[Value],
+        do_update: &DoUpdate,
+        txn_id: u64,
+    ) -> crate::error::Result<()> {
+        let existing = self
+            .storage
+            .get(table, row_id)?
+            .ok_or_else(|| crate::error::MoodengError::Execution("conflict row vanished".into()))?;
+
+        if let Some(w) = &do_update.selection {
+            if !eval_where_with_excluded(w, &existing.values, col_names, Some(proposed))? {
+                return Ok(());
+            }
+        }
+
+        let handle = self.locks.row_lock(table, row_id);
+        let _guard = handle.write();
+
+        if self.session.transaction.is_active() && !self.session.auto_commit {
+            self.session.transaction.record(UndoRecord::Update {
+                table: table.to_string(),
+                row_id,
+                old_row: existing.clone(),
+            });
+        }
+
+        let mut row = existing;
+        self.indexes
+            .remove_row(table, &row.values, col_names, row_id);
+
+        for assign in &do_update.assignments {
+            let (col, val) =
+                assignment_value_with_excluded(assign, &row.values, col_names, Some(proposed))?;
+            if let Some(idx) = self.catalog.column_index(schema, &col) {
+                row.values[idx] = val.coerce_to(&schema.columns[idx].data_type)?;
+            }
+        }
+
+        Self::validate_row(schema, &row.values)?;
+
+        let expected_version = row.version;
+        self.storage
+            .update(table, row_id, row.clone(), txn_id, expected_version)?;
+        self.indexes
+            .insert_row(table, &row.values, col_names, row_id)?;
+        Ok(())
     }
 
     fn select(&self, query: &Query) -> crate::error::Result<QueryResult> {

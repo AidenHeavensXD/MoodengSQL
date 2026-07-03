@@ -589,3 +589,87 @@ fn fifty_concurrent_row_inserts() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn insert_on_conflict_do_nothing_skips_duplicate() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'ignored') ON CONFLICT DO NOTHING")
+        .unwrap();
+
+    let result = db.execute("SELECT * FROM t WHERE id = 1").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[1].to_display_string(), "first");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_on_conflict_do_update_sets_excluded_values() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 'updated') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    )
+    .unwrap();
+
+    let result = db.execute("SELECT * FROM t WHERE id = 1").unwrap();
+    assert_eq!(result.rows[0].values[1].to_display_string(), "updated");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_on_conflict_do_update_where_filters() {
+    let dir = temp_data_dir();
+    let db = Database::open(&dir).unwrap();
+
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 60)").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score WHERE t.score < 50",
+    )
+    .unwrap();
+
+    let result = db.execute("SELECT score FROM t WHERE id = 1").unwrap();
+    assert_eq!(result.rows[0].values[0].to_display_string(), "60");
+
+    db.execute(
+        "INSERT INTO t VALUES (1, 88) ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score WHERE t.score < 100",
+    )
+    .unwrap();
+
+    let result = db.execute("SELECT score FROM t WHERE id = 1").unwrap();
+    assert_eq!(result.rows[0].values[0].to_display_string(), "88");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_on_conflict_persists_after_restart() {
+    let dir = temp_data_dir();
+
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'v1')").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'v2') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+        )
+        .unwrap();
+    }
+
+    {
+        let db = Database::open(&dir).unwrap();
+        let result = db.execute("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0].values[0].to_display_string(), "v2");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

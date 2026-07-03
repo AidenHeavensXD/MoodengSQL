@@ -85,10 +85,23 @@ fn dt_name(dt: &SqlDataType) -> Option<&str> {
 }
 
 pub fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> crate::error::Result<Value> {
+    eval_expr_with_excluded(expr, row, columns, None)
+}
+
+pub fn eval_expr_with_excluded(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    excluded: Option<&[Value]>,
+) -> crate::error::Result<Value> {
     match expr {
         Expr::Value(v) => Ok(Value::from_sql_literal(v)),
         Expr::Identifier(Ident { value, .. }) => column_value(value, row, columns),
         Expr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 && parts[0].value.eq_ignore_ascii_case("excluded") {
+                let col = parts[parts.len() - 1].value.clone();
+                return excluded_value(&col, excluded, columns);
+            }
             let col = if parts.len() >= 2 {
                 format!(
                     "{}.{}",
@@ -101,12 +114,12 @@ pub fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> crate::error
             column_value(&col, row, columns)
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = eval_expr(left, row, columns)?;
-            let r = eval_expr(right, row, columns)?;
+            let l = eval_expr_with_excluded(left, row, columns, excluded)?;
+            let r = eval_expr_with_excluded(right, row, columns, excluded)?;
             eval_binary(&l, op, &r)
         }
         Expr::UnaryOp { op, expr } => {
-            let v = eval_expr(expr, row, columns)?;
+            let v = eval_expr_with_excluded(expr, row, columns, excluded)?;
             match op {
                 sqlparser::ast::UnaryOperator::Not => match v {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
@@ -118,27 +131,39 @@ pub fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> crate::error
                     Value::Float8(n) => Ok(Value::Float8(-n)),
                     other => Ok(other),
                 },
-                _ => eval_expr(expr, row, columns),
+                _ => eval_expr_with_excluded(expr, row, columns, excluded),
             }
         }
         Expr::IsNull(expr) => {
-            let v = eval_expr(expr, row, columns)?;
+            let v = eval_expr_with_excluded(expr, row, columns, excluded)?;
             Ok(Value::Bool(v.is_null()))
         }
         Expr::IsNotNull(expr) => {
-            let v = eval_expr(expr, row, columns)?;
+            let v = eval_expr_with_excluded(expr, row, columns, excluded)?;
             Ok(Value::Bool(!v.is_null()))
         }
-        Expr::Nested(inner) => eval_expr(inner, row, columns),
-        Expr::Function(func) => eval_function(func, row, columns),
+        Expr::Nested(inner) => eval_expr_with_excluded(inner, row, columns, excluded),
+        Expr::Function(func) => eval_function_with_excluded(func, row, columns, excluded),
         _ => Ok(Value::Null),
     }
 }
 
+fn excluded_value(
+    col: &str,
+    excluded: Option<&[Value]>,
+    columns: &[String],
+) -> crate::error::Result<Value> {
+    let row = excluded.ok_or_else(|| {
+        crate::error::MoodengError::Execution("EXCLUDED is only valid in ON CONFLICT DO UPDATE".into())
+    })?;
+    column_value(col, row, columns)
+}
+
 fn column_value(col: &str, row: &[Value], columns: &[String]) -> crate::error::Result<Value> {
+    let bare = col.rsplit('.').next().unwrap_or(col);
     let idx = columns
         .iter()
-        .position(|c| c.eq_ignore_ascii_case(col))
+        .position(|c| c.eq_ignore_ascii_case(col) || c.eq_ignore_ascii_case(bare))
         .ok_or_else(|| crate::error::MoodengError::ColumnNotFound(col.into()))?;
     Ok(row.get(idx).cloned().unwrap_or(Value::Null))
 }
@@ -198,10 +223,11 @@ fn compare_ints(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     Some(as_i64(a)?.cmp(&as_i64(b)?))
 }
 
-fn eval_function(
+fn eval_function_with_excluded(
     func: &sqlparser::ast::Function,
     row: &[Value],
     columns: &[String],
+    excluded: Option<&[Value]>,
 ) -> crate::error::Result<Value> {
     let name = func.name.to_string().to_uppercase();
     let args = match &func.args {
@@ -217,7 +243,7 @@ fn eval_function(
                     sqlparser::ast::FunctionArgExpr::Expr(expr),
                 ) = arg
                 {
-                    if let Value::Text(s) = eval_expr(expr, row, columns)? {
+                    if let Value::Text(s) = eval_expr_with_excluded(expr, row, columns, excluded)? {
                         return Ok(Value::Text(s.to_uppercase()));
                     }
                 }
@@ -230,7 +256,7 @@ fn eval_function(
                     sqlparser::ast::FunctionArgExpr::Expr(expr),
                 ) = arg
                 {
-                    if let Value::Text(s) = eval_expr(expr, row, columns)? {
+                    if let Value::Text(s) = eval_expr_with_excluded(expr, row, columns, excluded)? {
                         return Ok(Value::Text(s.to_lowercase()));
                     }
                 }
@@ -242,7 +268,16 @@ fn eval_function(
 }
 
 pub fn eval_where(expr: &Expr, row: &[Value], columns: &[String]) -> crate::error::Result<bool> {
-    match eval_expr(expr, row, columns)? {
+    eval_where_with_excluded(expr, row, columns, None)
+}
+
+pub fn eval_where_with_excluded(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    excluded: Option<&[Value]>,
+) -> crate::error::Result<bool> {
+    match eval_expr_with_excluded(expr, row, columns, excluded)? {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false),
         _ => Ok(true),
@@ -254,6 +289,15 @@ pub fn assignment_value(
     row: &[Value],
     columns: &[String],
 ) -> crate::error::Result<(String, Value)> {
+    assignment_value_with_excluded(assign, row, columns, None)
+}
+
+pub fn assignment_value_with_excluded(
+    assign: &Assignment,
+    row: &[Value],
+    columns: &[String],
+    excluded: Option<&[Value]>,
+) -> crate::error::Result<(String, Value)> {
     use sqlparser::ast::AssignmentTarget;
     let col = match &assign.target {
         AssignmentTarget::ColumnName(name) => extract_table_name(name),
@@ -262,7 +306,7 @@ pub fn assignment_value(
             .map(extract_table_name)
             .unwrap_or_default(),
     };
-    let val = eval_expr(&assign.value, row, columns)?;
+    let val = eval_expr_with_excluded(&assign.value, row, columns, excluded)?;
     Ok((col, val))
 }
 
