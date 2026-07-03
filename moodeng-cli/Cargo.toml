@@ -1,0 +1,18 @@
+[package]
+name = "moodeng-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MoodengSQL interactive CLI client"
+
+[[bin]]
+name = "moodeng"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+clap.workspace = true
+rustyline = "15"

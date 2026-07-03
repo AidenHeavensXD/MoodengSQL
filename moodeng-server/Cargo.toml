@@ -1,0 +1,21 @@
+[package]
+name = "moodeng-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MoodengSQL server — PostgreSQL-compatible wire protocol"
+
+[[bin]]
+name = "moodengsql"
+path = "src/main.rs"
+
+[dependencies]
+moodeng-core = { path = "../moodeng-core" }
+anyhow.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true

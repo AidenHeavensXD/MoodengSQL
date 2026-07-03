@@ -1,0 +1,14 @@
+# MoodengSQL data
+moodeng_data/
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Logs
+*.log
