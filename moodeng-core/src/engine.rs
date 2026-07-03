@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
@@ -8,7 +9,7 @@ use crate::index::IndexManager;
 use crate::lock::LockManager;
 use crate::meta::{reconcile_storage, DatabaseSnapshot, MetaStore};
 use crate::recovery::replay_wal;
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, StorageOptions};
 use crate::transaction::Session;
 use crate::types::QueryResult;
 use crate::wal::WriteAheadLog;
@@ -23,6 +24,10 @@ pub struct Database {
     wal: Arc<WriteAheadLog>,
     data_dir: PathBuf,
     stats: RwLock<DatabaseStats>,
+    /// Exclusive during live backup; DML holds a read guard for point-in-time snapshots.
+    backup_lock: Arc<RwLock<()>>,
+    /// Active write transactions — backup waits until this reaches zero.
+    active_write_txns: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,12 +38,23 @@ pub struct DatabaseStats {
 
 impl Database {
     pub fn open(data_dir: impl AsRef<Path>) -> crate::error::Result<Self> {
+        Self::open_with_options(data_dir, StorageOptions::default())
+    }
+
+    pub fn open_with_options(
+        data_dir: impl AsRef<Path>,
+        storage_options: StorageOptions,
+    ) -> crate::error::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
         let wal = Arc::new(WriteAheadLog::open(&data_dir)?);
         let catalog = Arc::new(Catalog::new());
-        let storage = Arc::new(StorageEngine::open(&data_dir, Arc::clone(&wal))?);
+        let storage = Arc::new(StorageEngine::open_with_options(
+            &data_dir,
+            Arc::clone(&wal),
+            storage_options,
+        )?);
         let indexes = Arc::new(IndexManager::new());
         let locks = Arc::new(LockManager::new());
         let meta_store = MetaStore::new(&data_dir);
@@ -67,6 +83,8 @@ impl Database {
             wal,
             data_dir,
             stats: RwLock::new(DatabaseStats::default()),
+            backup_lock: Arc::new(RwLock::new(())),
+            active_write_txns: Arc::new(AtomicUsize::new(0)),
         };
 
         let warnings = reconcile_storage(&db.data_dir, &db.catalog.list_tables())?;
@@ -79,6 +97,20 @@ impl Database {
 
     pub fn in_memory() -> crate::error::Result<Self> {
         Self::open(std::env::temp_dir().join(format!("moodengsql_mem_{}", uuid::Uuid::new_v4())))
+    }
+
+    pub fn backup_lock(&self) -> &Arc<RwLock<()>> {
+        &self.backup_lock
+    }
+
+    pub fn active_write_txns(&self) -> &Arc<AtomicUsize> {
+        &self.active_write_txns
+    }
+
+    pub fn wait_for_write_txns(&self) {
+        while self.active_write_txns.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
     }
 
     pub fn execute(&self, sql: &str) -> crate::error::Result<QueryResult> {
@@ -95,6 +127,8 @@ impl Database {
             &self.storage,
             &self.indexes,
             &self.locks,
+            &self.backup_lock,
+            &self.active_write_txns,
             session,
         );
         let result = executor.execute(sql)?;

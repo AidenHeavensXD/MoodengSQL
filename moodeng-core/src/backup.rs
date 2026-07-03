@@ -49,6 +49,9 @@ pub fn backup(data_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> crate::er
 
 /// Backup with checkpoint — flushes WAL and metadata before archiving.
 pub fn backup_live(db: &Database, output: impl AsRef<Path>) -> crate::error::Result<()> {
+    db.wait_for_write_txns();
+    let _guard = db.backup_lock().write();
+    db.wait_for_write_txns();
     db.checkpoint()?;
     backup(db.data_dir(), output)
 }

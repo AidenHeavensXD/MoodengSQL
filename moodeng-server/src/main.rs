@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod protocol;
 mod session;
+mod tls;
 
 use clap::{Parser, Subcommand};
 use moodeng_core::{backup_live, restore, Database, ENGINE_NAME, ENGINE_VERSION, OWNER};
@@ -15,6 +16,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use auth::{hash_password, AuthConfig};
 use config::Config;
+use tls::TlsSettings;
 
 #[derive(Parser, Debug)]
 #[command(name = "moodengsql", about = "MoodengSQL — blazing-fast PostgreSQL-like database")]
@@ -111,8 +113,12 @@ fn data_dir(cfg: &Config, override_dir: Option<PathBuf>) -> PathBuf {
     override_dir.unwrap_or_else(|| cfg.storage.data_dir.clone())
 }
 
-fn auth_config(cfg: &Config) -> AuthConfig {
-    AuthConfig::from_config_and_env(cfg.auth.password_hash.clone())
+fn auth_config(cfg: &Config, tls: &TlsSettings) -> AuthConfig {
+    let mut auth = AuthConfig::from_config_and_env(cfg.auth.password_hash.clone());
+    if auth.required() && tls.tls_available() {
+        auth.require_tls_for_password = true;
+    }
+    auth
 }
 
 fn init_logging(cfg: &Config) {
@@ -285,7 +291,19 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     let port = args.port.unwrap_or(cfg.server.port);
     let data_dir = data_dir(cfg, args.data_dir.clone());
     let max_connections = args.max_connections.unwrap_or(cfg.server.max_connections);
-    let auth = Arc::new(auth_config(cfg));
+    let tls_settings = TlsSettings::from_server_config(&cfg.server);
+    let tls_acceptor = tls_settings
+        .load_server_config()?
+        .map(|cfg| Arc::new(tokio_rustls::TlsAcceptor::from(cfg)));
+    let auth = Arc::new(auth_config(cfg, &tls_settings));
+
+    if tls_settings.require_tls && !tls_settings.tls_available() {
+        anyhow::bail!("require_tls is enabled but tls_cert / tls_key are not configured");
+    }
+
+    if tls_settings.tls_available() {
+        info!("TLS enabled for wire protocol");
+    }
 
     if auth.required() {
         info!("Password authentication enabled");
@@ -293,7 +311,13 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
         warn!("No password configured — trust mode (set [auth].password_hash or MOODENG_PASSWORD)");
     }
 
-    let db = Arc::new(Database::open(&data_dir)?);
+    let db = Arc::new(Database::open_with_options(
+        &data_dir,
+        moodeng_core::StorageOptions {
+            max_cached_pages: cfg.storage.max_cached_pages,
+            rows_per_page: cfg.storage.rows_per_page,
+        },
+    )?);
 
     info!("╔══════════════════════════════════════════╗");
     info!("║  {ENGINE_NAME} v{ENGINE_VERSION}                  ║");
@@ -313,6 +337,8 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
         let (stream, peer) = listener.accept().await?;
         let db = Arc::clone(&db);
         let auth = Arc::clone(&auth);
+        let tls_settings = tls_settings.clone();
+        let tls_acceptor = tls_acceptor.clone();
         let permit = Arc::clone(&connection_limit);
 
         tokio::spawn(async move {
@@ -321,7 +347,9 @@ async fn run_serve(cfg: &Config, args: &ServeArgs) -> anyhow::Result<()> {
                 Err(_) => return,
             };
             info!("Connection from {peer}");
-            if let Err(e) = protocol::handle_connection(stream, db, auth).await {
+            if let Err(e) =
+                protocol::handle_connection(stream, db, auth, tls_settings, tls_acceptor).await
+            {
                 tracing::debug!("Connection closed: {e}");
             }
         });

@@ -3,6 +3,10 @@ use sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
 };
 
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use crate::catalog::{Catalog, IndexMeta};
 use crate::index::{BTreeIndex, IndexManager};
 use crate::lock::LockManager;
@@ -22,6 +26,8 @@ pub struct Executor<'a> {
     storage: &'a StorageEngine,
     indexes: &'a IndexManager,
     locks: &'a LockManager,
+    backup_lock: &'a Arc<RwLock<()>>,
+    active_write_txns: &'a Arc<AtomicUsize>,
     session: &'a mut Session,
 }
 
@@ -31,6 +37,8 @@ impl<'a> Executor<'a> {
         storage: &'a StorageEngine,
         indexes: &'a IndexManager,
         locks: &'a LockManager,
+        backup_lock: &'a Arc<RwLock<()>>,
+        active_write_txns: &'a Arc<AtomicUsize>,
         session: &'a mut Session,
     ) -> Self {
         Self {
@@ -38,6 +46,8 @@ impl<'a> Executor<'a> {
             storage,
             indexes,
             locks,
+            backup_lock,
+            active_write_txns,
             session,
         }
     }
@@ -108,6 +118,14 @@ impl<'a> Executor<'a> {
         }
     }
 
+    fn track_write_txn_start(&self) {
+        self.active_write_txns.fetch_add(1, Ordering::Release);
+    }
+
+    fn track_write_txn_end(&self) {
+        self.active_write_txns.fetch_sub(1, Ordering::Release);
+    }
+
     fn begin(&mut self) -> crate::error::Result<QueryResult> {
         if self.session.transaction.is_active() {
             return Err(crate::error::MoodengError::Execution(
@@ -116,6 +134,7 @@ impl<'a> Executor<'a> {
         }
         self.session.auto_commit = false;
         self.session.transaction.begin(self.storage.wal())?;
+        self.track_write_txn_start();
         Ok(QueryResult::modified(0, "BEGIN"))
     }
 
@@ -127,6 +146,7 @@ impl<'a> Executor<'a> {
         }
         self.session.auto_commit = false;
         self.session.transaction.commit(self.storage.wal())?;
+        self.track_write_txn_end();
         Ok(QueryResult::modified(0, "COMMIT"))
     }
 
@@ -141,6 +161,7 @@ impl<'a> Executor<'a> {
         for record in records {
             apply_undo(self.storage, self.indexes, self.catalog, &record)?;
         }
+        self.track_write_txn_end();
         Ok(QueryResult::modified(0, "ROLLBACK"))
     }
 
@@ -150,6 +171,7 @@ impl<'a> Executor<'a> {
         }
         self.session.transaction.begin(self.storage.wal())?;
         self.session.auto_commit = true;
+        self.track_write_txn_start();
         Ok(self.session.transaction.current_txn_id().unwrap())
     }
 
@@ -157,6 +179,7 @@ impl<'a> Executor<'a> {
         if self.session.auto_commit {
             self.session.transaction.commit(self.storage.wal())?;
             self.session.auto_commit = false;
+            self.track_write_txn_end();
         }
         Ok(())
     }
@@ -248,6 +271,8 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let rows = values_from_insert(source)?;
         let mut count = 0u64;
+        let backup_lock = self.backup_lock;
+        let _backup = backup_lock.read();
         let txn_id = self.begin_write_txn()?;
 
         for values in rows {
@@ -506,6 +531,8 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
         let mut count = 0u64;
+        let backup_lock = self.backup_lock;
+        let _backup = backup_lock.read();
         let txn_id = self.begin_write_txn()?;
 
         for (id, mut row) in all_rows {
@@ -515,8 +542,8 @@ impl<'a> Executor<'a> {
             };
 
             if should_update {
-                let row_lock = self.locks.row_lock_for(table, id);
-                let _guard = row_lock.write();
+                let handle = self.locks.row_lock(table, id);
+                let _guard = handle.write();
 
                 if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Update {
@@ -557,6 +584,8 @@ impl<'a> Executor<'a> {
         let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let all_rows = self.storage.scan(table)?;
         let mut count = 0u64;
+        let backup_lock = self.backup_lock;
+        let _backup = backup_lock.read();
         let txn_id = self.begin_write_txn()?;
 
         for (id, row) in all_rows {
@@ -566,8 +595,8 @@ impl<'a> Executor<'a> {
             };
 
             if should_delete {
-                let row_lock = self.locks.row_lock_for(table, id);
-                let _guard = row_lock.write();
+                let handle = self.locks.row_lock(table, id);
+                let _guard = handle.write();
 
                 if self.session.transaction.is_active() && !self.session.auto_commit {
                     self.session.transaction.record(UndoRecord::Delete {

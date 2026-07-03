@@ -28,12 +28,27 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// PEM certificate for TLS (PostgreSQL SSLRequest upgrade).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for TLS.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+    /// Reject plaintext connections; clients must send SSLRequest first.
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// LRU page cache size per table (0 = legacy in-memory `.dat` mode).
+    #[serde(default)]
+    pub max_cached_pages: usize,
+    /// Rows stored per on-disk page when page cache is enabled.
+    #[serde(default = "default_rows_per_page")]
+    pub rows_per_page: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +74,9 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             max_connections: default_max_connections(),
+            tls_cert: None,
+            tls_key: None,
+            require_tls: false,
         }
     }
 }
@@ -67,6 +85,8 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            max_cached_pages: 0,
+            rows_per_page: default_rows_per_page(),
         }
     }
 }
@@ -93,6 +113,9 @@ fn default_data_dir() -> PathBuf {
 }
 fn default_log_level() -> String {
     "info".into()
+}
+fn default_rows_per_page() -> usize {
+    16
 }
 
 impl Config {

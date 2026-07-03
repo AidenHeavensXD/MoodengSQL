@@ -7,6 +7,8 @@ use rand::rngs::OsRng;
 pub struct AuthConfig {
     /// Argon2 password hash. When `None`, connections are accepted without auth (trust mode).
     pub password_hash: Option<String>,
+    /// When true, cleartext password messages are rejected unless the connection uses TLS.
+    pub require_tls_for_password: bool,
 }
 
 impl AuthConfig {
@@ -14,12 +16,14 @@ impl AuthConfig {
         if let Some(hash) = hash_from_file.filter(|h| !h.is_empty()) {
             return Self {
                 password_hash: Some(hash),
+                require_tls_for_password: false,
             };
         }
         if let Ok(password) = std::env::var("MOODENG_PASSWORD") {
             if !password.is_empty() {
                 return Self {
                     password_hash: Some(hash_password(&password)),
+                    require_tls_for_password: false,
                 };
             }
         }
@@ -75,6 +79,7 @@ mod tests {
 
         let auth = Arc::new(AuthConfig {
             password_hash: Some(hash_password("secret")),
+            require_tls_for_password: false,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

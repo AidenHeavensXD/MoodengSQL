@@ -258,6 +258,123 @@ fn backup_and_restore_roundtrip() {
 }
 
 #[test]
+fn paged_storage_queries_beyond_cache_limit() {
+    use moodeng_core::StorageOptions;
+
+    let dir = temp_data_dir();
+    let opts = StorageOptions {
+        max_cached_pages: 2,
+        rows_per_page: 8,
+    };
+    let db = Database::open_with_options(&dir, opts).unwrap();
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, v TEXT)").unwrap();
+
+    for i in 1..=200 {
+        db.execute(&format!("INSERT INTO big VALUES ({i}, 'row{i}')"))
+            .unwrap();
+    }
+
+    assert_eq!(db.storage.row_count("big"), 200);
+    assert!(
+        db.storage.page_cache_len("big") <= 2,
+        "page cache should respect LRU bound"
+    );
+
+    let result = db.execute("SELECT * FROM big WHERE id = 199").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[1].to_display_string(), "row199");
+
+    let count = db.execute("SELECT * FROM big").unwrap().rows.len();
+    assert_eq!(count, 200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backup_under_concurrent_writes_has_no_partial_transactions() {
+    use moodeng_core::{backup_live, restore, Database};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let src = temp_data_dir();
+    let dst = temp_data_dir();
+    let archive = std::env::temp_dir().join(format!(
+        "moodeng_backup_concurrent_{}.tar.gz",
+        uuid::Uuid::new_v4()
+    ));
+
+    let db = Arc::new(Database::open(&src).unwrap());
+    db.execute("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT)").unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_db = Arc::clone(&db);
+    let stop_flag = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let mut session = Session::new();
+        let mut txn = 1i64;
+        while !stop_flag.load(Ordering::Relaxed) {
+            let _ = writer_db.execute_session(&mut session, "BEGIN");
+            let _ = writer_db.execute_session(
+                &mut session,
+                &format!("INSERT INTO parent VALUES ({txn})"),
+            );
+            let _ = writer_db.execute_session(
+                &mut session,
+                &format!("INSERT INTO child VALUES ({txn}, {txn})"),
+            );
+            let _ = writer_db.execute_session(&mut session, "COMMIT");
+            txn += 1;
+        }
+    });
+
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(5));
+        backup_live(&db, &archive).unwrap();
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+
+    restore(&dst, &archive).unwrap();
+    let restored = Database::open(&dst).unwrap();
+
+    let parents = restored.execute("SELECT id FROM parent").unwrap();
+    let children = restored.execute("SELECT id, parent_id FROM child").unwrap();
+
+    let parent_ids: HashSet<String> = parents
+        .rows
+        .iter()
+        .map(|r| r.values[0].to_display_string())
+        .collect();
+    let mut child_pairs = HashSet::new();
+    for row in &children.rows {
+        let id = row.values[0].to_display_string();
+        let pid = row.values[1].to_display_string();
+        assert_eq!(id, pid, "child id must match parent_id in same txn");
+        assert!(
+            parent_ids.contains(&pid),
+            "child {id} references missing parent {pid}"
+        );
+        child_pairs.insert(id);
+    }
+    for row in &parents.rows {
+        let id = row.values[0].to_display_string();
+        assert!(
+            child_pairs.contains(&id),
+            "parent {id} must have matching child row"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn explain_shows_index_scan_for_pk_lookup() {
     let dir = temp_data_dir();
     let db = Database::open(&dir).unwrap();

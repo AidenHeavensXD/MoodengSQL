@@ -5,9 +5,14 @@
 host = "0.0.0.0"
 port = 5432
 max_connections = 100
+# tls_cert = "/path/to/cert.pem"
+# tls_key = "/path/to/key.pem"
+# require_tls = false
 
 [storage]
 data_dir = "./moodeng_data"
+# max_cached_pages = 64
+# rows_per_page = 16
 
 [log]
 level = "info"

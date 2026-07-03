@@ -12,6 +12,7 @@ pub mod executor;
 pub mod index;
 pub mod lock;
 pub mod meta;
+pub mod page_table;
 pub mod parser;
 pub mod planner;
 pub mod query_util;
@@ -28,6 +29,7 @@ pub use wal::{encode_wal_entry, replay_from_bytes, WalOp, WriteAheadLog};
 pub use error::{MoodengError, Result};
 pub use transaction::Session;
 pub use query_util::substitute_params;
+pub use storage::{RowId, StorageEngine, StorageOptions};
 pub use types::{ColumnDef, DataType, QueryResult, Row, Value};
 
 pub const ENGINE_NAME: &str = "MoodengSQL";
